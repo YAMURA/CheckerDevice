@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8692114721:AAEzk79ZgoANIFJ7Xlu6gBv9K6YbKap_UyU"
+BOT_TOKEN = "8692114721:AAF04qDeWcMH1EU8UtX8xrZvaj4x_QX7LDo"
 ADMIN_IDS = [8477982865]
 KEYS_FILE = "keys.json"
 USERS_FILE = "users.json"
