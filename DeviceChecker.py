@@ -48,15 +48,21 @@ _AES_IV = b'\x00' * 16
 
 # ── BAN CHECKER INTEGRATION (OPTIMIZED) ─────────────────────────────
 BAN_REASONS = {
+    "1": "Verbal Abuse / Inappropriate Avatar or Name",
+    "2": "Toxic Behavior / In-Game Chat Violation",
+    "3": "Intentional Feeding / AFK / Griefing",
+    "7": "Illegal Diamond Top-up / Refund Fraud",
     "21": "Using Plug-in Apps to Compromise Competitive Fairness",
-    "22": "Using Third-party Software",
-    "23": "Abusing Game Mechanics",
+    "22": "Account Security Risk / Fraudulent Activity",
+    "23": "Unauthorized Account Access",
     "24": "Toxic Behavior / Verbal Abuse",
     "25": "AFK / Idle in Match",
     "26": "Feed / Intentional Losing",
     "27": "Account Sharing",
     "28": "Inappropriate Name",
     "29": "Suspicious Activity",
+    "88": "Device Hardware Ban (HWID)",
+    "99": "Permanent System Security Violation",
 }
 
 # Connection pool for reuse
