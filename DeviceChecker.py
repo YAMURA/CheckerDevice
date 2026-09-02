@@ -46,6 +46,411 @@ READ_TO = float(os.environ.get('MLBB_READ_TO', '3.5'))
 _AES_KEY = bytes.fromhex('f5a193d50ade553e9835595f5cd75ddd')
 _AES_IV = b'\x00' * 16
 
+# ── BAN CHECKER INTEGRATION ──────────────────────────────────────────
+# Ban reason mapping
+BAN_REASONS = {
+    "21": "Using Plug-in Apps to Compromise Competitive Fairness",
+    "22": "Using Third-party Software",
+    "23": "Abusing Game Mechanics",
+    "24": "Toxic Behavior / Verbal Abuse",
+    "25": "AFK / Idle in Match",
+    "26": "Feed / Intentional Losing",
+    "27": "Account Sharing",
+    "28": "Inappropriate Name",
+    "29": "Suspicious Activity",
+}
+
+class SdpDataType(Enum):
+    INTEGER_POSITIVE = 0
+    INTEGER_NEGATIVE = 1
+    FLOAT = 2
+    DOUBLE = 3
+    STRING = 4
+    LIST = 5
+    DICT = 6
+    STRUCT_BEGIN = 7
+    STRUCT_END = 8
+
+class SdpException(Exception):
+    pass
+
+class SdpStruct(dict):
+    def __init__(self, data=None):
+        super().__init__()
+        self.data = b''
+        self.offset = 0
+        if isinstance(data, bytes):
+            self.data = data
+            self.offset = 0
+            self._unpack_from_binary()
+        elif data is not None:
+            super().update(data)
+            self._pack_to_binary()
+
+    def _pack_to_binary(self):
+        self.data = bytes([SdpDataType.STRUCT_BEGIN.value << 4])
+        for tag, value in sorted(self.items()):
+            self._pack(tag, value)
+        self.data += bytes([SdpDataType.STRUCT_END.value << 4])
+
+    def _unpack_from_binary(self):
+        if not self.data: return
+        if self.data[0] >> 4 == SdpDataType.STRUCT_BEGIN.value:
+            self.offset = 1
+        while self.offset < len(self.data):
+            tag, value = self._unpack()
+            if isinstance(value, SdpDataType) and value == SdpDataType.STRUCT_END:
+                break
+            self[tag] = value
+
+    def _write_number(self, value: int) -> bytes:
+        result = bytearray()
+        while value >= 0x80:
+            result.append((value & 0x7F) | 0x80)
+            value >>= 7
+        result.append(value & 0x7F)
+        return bytes(result)
+
+    def _read_number(self) -> int:
+        n = 1
+        val = self.data[self.offset] & 0x7F
+        while self.data[self.offset + n - 1] >= 0x80:
+            val |= (self.data[self.offset + n] & 0x7F) << (7 * n)
+            n += 1
+        self.offset += n
+        return val
+
+    def _pack_header(self, tag: int, data_type: SdpDataType) -> None:
+        if tag < 15:
+            self.data += bytes([(data_type.value << 4) | tag])
+        else:
+            self.data += bytes([(data_type.value << 4) | 15])
+            self.data += self._write_number(tag)
+
+    def _pack(self, tag: int, value: Any) -> None:
+        if isinstance(value, bool):
+            self._pack_header(tag, SdpDataType.INTEGER_POSITIVE)
+            self.data += self._write_number(1 if value else 0)
+        elif isinstance(value, int):
+            if value < 0:
+                self._pack_header(tag, SdpDataType.INTEGER_NEGATIVE)
+                self.data += self._write_number(-value)
+            else:
+                self._pack_header(tag, SdpDataType.INTEGER_POSITIVE)
+                self.data += self._write_number(value)
+        elif isinstance(value, float):
+            self._pack_header(tag, SdpDataType.DOUBLE)
+            packed = struct.pack("<d", value)
+            self.data += self._write_number(len(packed))
+            self.data += packed
+        elif isinstance(value, (str, bytes)):
+            self._pack_header(tag, SdpDataType.STRING)
+            encoded = value.encode('utf-8') if isinstance(value, str) else value
+            self.data += self._write_number(len(encoded))
+            self.data += encoded
+        elif isinstance(value, list):
+            self._pack_header(tag, SdpDataType.LIST)
+            self.data += self._write_number(len(value))
+            for item in value:
+                self._pack(0, item)
+        elif isinstance(value, dict):
+            if isinstance(value, SdpStruct):
+                self._pack_header(tag, SdpDataType.STRUCT_BEGIN)
+                for k, v in sorted(value.items()):
+                    self._pack(k, v)
+                self.data += bytes([SdpDataType.STRUCT_END.value << 4])
+            else:
+                self._pack_header(tag, SdpDataType.DICT)
+                self.data += self._write_number(len(value))
+                for k, v in sorted(value.items()):
+                    self._pack(0, k)
+                    self._pack(0, v)
+        else:
+            raise SdpException(f"Unsupported type: {type(value)}")
+
+    def _unpack(self) -> Tuple[int, Any]:
+        try:
+            if self.offset >= len(self.data): return 0, None
+            header = self.data[self.offset]
+            tag = header & 0xF
+            data_type = SdpDataType(header >> 4)
+            self.offset += 1
+            if tag == 15: tag = self._read_number()
+
+            if data_type == SdpDataType.INTEGER_POSITIVE: return tag, self._read_number()
+            elif data_type == SdpDataType.INTEGER_NEGATIVE: return tag, -self._read_number()
+            elif data_type == SdpDataType.FLOAT:
+                val = self._read_number().to_bytes(4, 'little')
+                return tag, struct.unpack("<f", val)[0]
+            elif data_type == SdpDataType.DOUBLE:
+                val = self._read_number().to_bytes(8, 'little')
+                return tag, struct.unpack("<d", val)[0]
+            elif data_type == SdpDataType.STRING:
+                length = self._read_number()
+                try: val = self.data[self.offset:self.offset+length].decode('utf-8')
+                except UnicodeDecodeError: val = self.data[self.offset:self.offset+length]
+                self.offset += length
+                return tag, val
+            elif data_type == SdpDataType.LIST:
+                length = self._read_number()
+                val = []
+                for _ in range(length):
+                    _, item = self._unpack()
+                    val.append(item)
+                return tag, val
+            elif data_type == SdpDataType.DICT:
+                length = self._read_number()
+                val = {}
+                for _ in range(length):
+                    _, k = self._unpack()
+                    _, v = self._unpack()
+                    val[k] = v
+                return tag, val
+            elif data_type == SdpDataType.STRUCT_BEGIN:
+                struct_data = {}
+                while True:
+                    sub_tag, sub_value = self._unpack()
+                    if isinstance(sub_value, SdpDataType) and sub_value == SdpDataType.STRUCT_END:
+                        break
+                    struct_data[sub_tag] = sub_value
+                return tag, SdpStruct(struct_data)
+            elif data_type == SdpDataType.STRUCT_END:
+                return tag, SdpDataType.STRUCT_END
+            else: raise SdpException("Unknown data type")
+        except Exception:
+            raise SdpException("Unpack error")
+
+class BanCheckerConnection:
+    def __init__(self, device_id: str):
+        self.host = 'login.ml.youngjoygame.com'
+        self.port = 30021
+        self.sequence = 1
+        self.socket = None
+        self.queue_data = b''
+        self.device_id = device_id
+        
+        parts = device_id.split('_')
+        device_info = parts[1] if len(parts) >= 2 else device_id
+        if len(parts) >= 3 and len(device_info) < 32:
+            device_info = device_info + "_" + parts[2]
+
+        if len(device_info) >= 32:
+            self.imei_md5 = device_info[:32]
+            self.android_id = device_info[32:48] if len(device_info) >= 48 else ""
+            self.advertising_id = device_info[48:] if len(device_info) > 48 else ""
+        else:
+            self.imei_md5 = device_id
+            self.android_id = ""
+            self.advertising_id = ""
+
+        self.channel = 'and_usa'
+        self.client_version = '2.1.61.1205.1'
+        self.account_id = 0
+        self.session_key = ''
+        self.zone_id = 0
+        self.game_server_host = ''
+        self.game_server_port = 0
+
+    def connect(self, host=None, port=None):
+        if host: self.host = host
+        if port: self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((self.host, self.port))
+        self.socket.settimeout(5)
+
+    def cleanup(self):
+        if self.socket:
+            self.socket.close()
+            self.sequence = 1
+            self.socket = None
+
+    def send_data(self, pkt_id, sdp):
+        packet = SdpStruct({
+            0: pkt_id,
+            1: self.sequence,
+            5: sdp.data
+        }).data
+        buf = zstd.compress(packet)
+        flags = (len(buf) + 4) | (16 << 24)
+        buf = flags.to_bytes(4, 'big') + buf
+        self.socket.send(buf)
+        self.sequence += 1
+
+    def recv_data(self):
+        try:
+            while len(self.queue_data) < 4:
+                data = self.socket.recv(4096)
+                if not data: return None, None
+                self.queue_data += data
+
+            flags = int.from_bytes(self.queue_data[:4], 'big')
+            size = flags & 0xFFFFFF
+            compression_type = flags >> 24
+
+            while len(self.queue_data) < size:
+                data = self.socket.recv(4096)
+                if not data: return None, None
+                self.queue_data += data
+
+            data = self.queue_data[4:size]
+            self.queue_data = self.queue_data[size:]
+
+            if compression_type == 1:
+                data = zlib.decompress(data)
+            elif compression_type == 16:
+                data = zstd.decompress(data)
+            elif compression_type in (2, 3, 18):
+                cipher = AES.new(_AES_KEY, AES.MODE_CBC, iv=_AES_IV)
+                data = cipher.decrypt(data[:-1] if len(data) % 16 != 0 else data)
+                data = data.rstrip(b'\x00')
+                if compression_type == 3: data = zlib.decompress(data)
+                elif compression_type == 18: data = zstd.decompress(data)
+
+            result = SdpStruct(data)
+            pkt_id = result[0]
+            if pkt_id is None: return None, None
+
+            res = result.get(6) or result.get(5)
+            if not res or not isinstance(res, bytes):
+                return pkt_id, None
+
+            return pkt_id, SdpStruct(res)
+
+        except socket.timeout: return -1, None
+        except Exception: return None, None
+
+def inspect_for_ban(pkt_id, sdp_data):
+    is_banned = False
+    details = {}
+
+    if sdp_data:
+        def scan(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k == 'ban_reason':
+                        code_str = str(v)
+                        details['ban_code'] = code_str
+                        details['reason_name'] = BAN_REASONS.get(code_str, "Using Plug-in Apps to Compromise Competitive Fairness")
+                    elif k in ('ban_status', 'ban_time') or (isinstance(k, str) and 'ban' in k.lower()):
+                        details[str(k)] = v
+                    
+                    if k == 'endtime_day': details['endtime_day'] = v
+                    if k == 'endtime_hour': details['endtime_hour'] = v
+                    if k == 'endtime_min': details['endtime_min'] = v
+                    if k == 'endtime_sec': details['endtime_sec'] = v
+
+                    if isinstance(v, (dict, list)): scan(v)
+            elif isinstance(obj, list):
+                for item in obj: scan(item)
+
+        scan(dict(sdp_data))
+
+    if 'endtime_day' in details and details['endtime_day'] is not None:
+        is_banned = True
+
+    return is_banned, details
+
+def check_device_ban_silent(device_id: str) -> Tuple[str, dict]:
+    """Check if a device is banned. Returns (status, ban_info)"""
+    conn = BanCheckerConnection(device_id)
+    try:
+        conn.connect('login.ml.youngjoygame.com', 30021)
+        conn.send_data(1, SdpStruct({
+            0: conn.device_id,
+            1: f'gps_adid={conn.advertising_id}&android_id={conn.android_id}&device_unique_id={conn.imei_md5}',
+            2: conn.client_version,
+            3: conn.channel,
+            4: 'en'
+        }))
+
+        pkt_id, res = conn.recv_data()
+        banned, ban_info = inspect_for_ban(pkt_id, res)
+        if banned: 
+            return "BANNED", ban_info
+
+        if pkt_id == 2 and res:
+            conn.account_id = res.get(0)
+            conn.session_key = res.get(1)
+            zone_data = res.get(2)
+            if isinstance(zone_data, dict): conn.zone_id = zone_data.get(0, 0)
+            elif isinstance(zone_data, list) and len(zone_data) > 0:
+                conn.zone_id = zone_data[0] if not isinstance(zone_data[0], dict) else zone_data[0].get(0, 0)
+            else: conn.zone_id = zone_data or 0
+        else:
+            return "UNKNOWN", {}
+
+        conn.send_data(5, SdpStruct({
+            0: conn.account_id, 1: conn.session_key, 2: conn.client_version,
+            5: conn.zone_id, 6: conn.channel
+        }))
+
+        pkt_id, res = conn.recv_data()
+        banned, ban_info = inspect_for_ban(pkt_id, res)
+        if banned: 
+            return "BANNED", ban_info
+
+        if pkt_id == 6 and res:
+            game_server = res[1]
+            conn.game_server_host, conn.game_server_port = game_server.split(':')
+            conn.game_server_port = int(conn.game_server_port)
+        else:
+            return "UNKNOWN", {}
+
+        conn.cleanup()
+        conn.connect(conn.game_server_host, conn.game_server_port)
+
+        conn.send_data(10001, SdpStruct({
+            0: conn.account_id, 1: conn.session_key, 2: conn.zone_id,
+            4: conn.client_version, 13: conn.channel, 15: conn.device_id
+        }))
+        conn.send_data(10101, SdpStruct({0: 0, 2: 2}))
+
+        role_requested = False
+        while True:
+            pkt_id, res = conn.recv_data()
+            banned, ban_info = inspect_for_ban(pkt_id, res)
+            
+            if banned:
+                return "BANNED", ban_info
+
+            if pkt_id is None or pkt_id == -1:
+                return "UNKNOWN", {}
+            elif pkt_id == 10002 and not role_requested:
+                conn.send_data(10003, SdpStruct({
+                    0: conn.account_id, 1: conn.session_key, 2: conn.zone_id,
+                    3: conn.client_version, 4: conn.channel, 5: conn.device_id
+                }))
+                role_requested = True
+            elif pkt_id in (10004, 10008):
+                return "CLEAN", {}
+    except Exception as e:
+        logger.error(f"Ban check error for {device_id}: {e}")
+        return "UNKNOWN", {}
+    finally:
+        conn.cleanup()
+
+def format_ban_info(ban_info: dict) -> str:
+    """Format ban information for display"""
+    if not ban_info:
+        return "No ban information available"
+    
+    lines = []
+    reason = ban_info.get('reason_name', 'Unknown reason')
+    lines.append(f"📋 **Ban Reason:** {reason}")
+    
+    if 'ban_code' in ban_info:
+        lines.append(f"🔢 **Ban Code:** {ban_info['ban_code']}")
+    
+    day = ban_info.get('endtime_day', '?')
+    hour = ban_info.get('endtime_hour', '00')
+    minute = ban_info.get('endtime_min', '00')
+    sec = ban_info.get('endtime_sec', '00')
+    lines.append(f"⏱️ **Duration:** Day {day}, {hour}:{minute}:{sec}")
+    
+    return "\n".join(lines)
+
+# ── END BAN CHECKER INTEGRATION ──────────────────────────────────────
+
 HERO_ID_MAP = {
     1: "Miya", 2: "Balmond", 3: "Saber", 4: "Alice", 5: "Nana", 6: "Tigreal",
     7: "Alucard", 8: "Karina", 9: "Akai", 10: "Franco", 11: "Bane", 12: "Bruno",
@@ -94,13 +499,6 @@ COLLECTOR_TIERS = [
 
 AFFINITY_MAP = {0: "None", 1: "Bronze", 2: "Silver", 3: "Gold", 4: "Platinum", 5: "Diamond"}
 ROMAN = ["V", "IV", "III", "II", "I"]
-
-# ==================== BAN CHECKER CONSTANTS ====================
-BAN_REASONS = {
-    "21": "Using Plug-in Apps to Compromise Competitive Fairness",
-}
-BAN_CHECKER_AES_KEY = bytes.fromhex('f5a193d50ade553e9835595f5cd75ddd')
-BAN_CHECKER_AES_IV = b'\x00' * 16
 
 
 def hero_name(hid):
@@ -397,9 +795,8 @@ class LiveStats:
             f"  Master: {self.rank_master:,} | GM: {self.rank_gm:,}\n"
             f"  Epic: {self.rank_epic:,} | Legend: {self.rank_legend:,}\n"
             f"  Mythic+: {self.rank_mythic:,}\n\n"
-            f"🔒 Ban Status\n"
-            f"  Banned: {self.banned:,} | Clean: {self.clean:,}\n"
-            f"  Unknown: {self.unknown:,}\n\n"
+            f"🚫 Ban Status\n"
+            f"  Banned: {self.banned:,} | Clean: {self.clean:,} | Unknown: {self.unknown:,}\n\n"
             f"📦 Hits: {self.total_hits:,} | Info: {self.with_info:,}\n"
             f"🚫 No Info: {self.no_info:,} | Unreg: {self.unreg:,}"
         )
@@ -929,241 +1326,6 @@ async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[
                     pass
 
 
-# ==================== BAN CHECKER IMPLEMENTATION ====================
-
-def inspect_for_ban(pkt_id, sdp_data) -> Tuple[bool, dict]:
-    """Check if a packet contains ban information."""
-    is_banned = False
-    details = {}
-
-    if sdp_data:
-        def scan(obj):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if k == 'ban_reason':
-                        code_str = str(v)
-                        details['ban_code'] = code_str
-                        details['reason_name'] = BAN_REASONS.get(code_str, "Using Plug-in Apps to Compromise Competitive Fairness")
-                    elif k in ('ban_status', 'ban_time') or (isinstance(k, str) and 'ban' in k.lower()):
-                        details[str(k)] = v
-                    
-                    if k == 'endtime_day': details['endtime_day'] = v
-                    if k == 'endtime_hour': details['endtime_hour'] = v
-                    if k == 'endtime_min': details['endtime_min'] = v
-                    if k == 'endtime_sec': details['endtime_sec'] = v
-
-                    if isinstance(v, (dict, list)): scan(v)
-            elif isinstance(obj, list):
-                for item in obj: scan(item)
-
-        scan(dict(sdp_data))
-
-    # STRICT CHECK: Banned ONLY if explicit 'endtime_day' exists
-    if 'endtime_day' in details and details['endtime_day'] is not None:
-        is_banned = True
-
-    return is_banned, details
-
-
-class BanCheckerConnection:
-    def __init__(self, device_id: str):
-        self.host = 'login.ml.youngjoygame.com'
-        self.port = 30021
-        self.sequence = 1
-        self.socket = None
-        self.queue_data = b''
-        self.device_id = device_id
-        
-        parts = device_id.split('_')
-        device_info = parts[1] if len(parts) >= 2 else device_id
-        if len(parts) >= 3 and len(device_info) < 32:
-            device_info = device_info + "_" + parts[2]
-
-        if len(device_info) >= 32:
-            self.imei_md5 = device_info[:32]
-            self.android_id = device_info[32:48] if len(device_info) >= 48 else ""
-            self.advertising_id = device_info[48:] if len(device_info) > 48 else ""
-        else:
-            self.imei_md5 = device_id
-            self.android_id = ""
-            self.advertising_id = ""
-
-        self.channel = 'and_usa'
-        self.client_version = '2.1.61.1205.1'
-        self.account_id = 0
-        self.session_key = ''
-        self.zone_id = 0
-        self.game_server_host = ''
-        self.game_server_port = 0
-
-    def connect(self, host=None, port=None):
-        if host: self.host = host
-        if port: self.port = port
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.connect((self.host, self.port))
-        self.socket.settimeout(5)
-
-    def cleanup(self):
-        if self.socket:
-            self.socket.close()
-            self.sequence = 1
-            self.socket = None
-
-    def send_data(self, pkt_id, sdp):
-        packet = SDP({
-            0: pkt_id,
-            1: self.sequence,
-            5: sdp.data
-        }).data
-        buf = zstd.compress(packet)
-        flags = (len(buf) + 4) | (16 << 24)
-        buf = flags.to_bytes(4, 'big') + buf
-        self.socket.send(buf)
-        self.sequence += 1
-
-    def recv_data(self):
-        try:
-            while len(self.queue_data) < 4:
-                data = self.socket.recv(4096)
-                if not data: return None, None
-                self.queue_data += data
-
-            flags = int.from_bytes(self.queue_data[:4], 'big')
-            size = flags & 0xFFFFFF
-            compression_type = flags >> 24
-
-            while len(self.queue_data) < size:
-                data = self.socket.recv(4096)
-                if not data: return None, None
-                self.queue_data += data
-
-            data = self.queue_data[4:size]
-            self.queue_data = self.queue_data[size:]
-
-            if compression_type == 1:
-                data = zlib.decompress(data)
-            elif compression_type == 16:
-                data = zstd.decompress(data)
-            elif compression_type in (2, 3, 18):
-                cipher = AES.new(BAN_CHECKER_AES_KEY, AES.MODE_CBC, iv=BAN_CHECKER_AES_IV)
-                data = cipher.decrypt(data[:-1] if len(data) % 16 != 0 else data)
-                data = data.rstrip(b'\x00')
-                if compression_type == 3: data = zlib.decompress(data)
-                elif compression_type == 18: data = zstd.decompress(data)
-
-            result = SDP(data)
-            pkt_id = result[0]
-            if pkt_id is None: return None, None
-
-            res = result.get(6) or result.get(5)
-            if not res or not isinstance(res, bytes):
-                return pkt_id, None
-
-            return pkt_id, SDP(res)
-
-        except socket.timeout: return -1, None
-        except Exception: return None, None
-
-
-def format_ban_string(device_id: str, ban_info: dict) -> str:
-    reason = ban_info.get('reason_name', 'Using Plug-in Apps to Compromise Competitive Fairness')
-    day = ban_info.get('endtime_day')
-    hour = ban_info.get('endtime_hour', '00')
-    minute = ban_info.get('endtime_min', '00')
-    sec = ban_info.get('endtime_sec', '00')
-    return f"{device_id} | Reason: {reason} | Duration: Day {day}, {hour}:{minute}:{sec}"
-
-
-def check_device_ban_silent(device_id: str) -> Tuple[str, str]:
-    """Check if a device is banned. Returns (status, result_string)."""
-    conn = BanCheckerConnection(device_id)
-    try:
-        conn.connect('login.ml.youngjoygame.com', 30021)
-        conn.send_data(1, SDP({
-            0: conn.device_id,
-            1: f'gps_adid={conn.advertising_id}&android_id={conn.android_id}&device_unique_id={conn.imei_md5}',
-            2: conn.client_version,
-            3: conn.channel,
-            4: 'en'
-        }))
-
-        pkt_id, res = conn.recv_data()
-        banned, ban_info = inspect_for_ban(pkt_id, res)
-        if banned: 
-            return "BANNED", format_ban_string(device_id, ban_info)
-
-        if pkt_id == 2 and res:
-            conn.account_id = res.get(0)
-            conn.session_key = res.get(1)
-            zone_data = res.get(2)
-            if isinstance(zone_data, dict): 
-                conn.zone_id = zone_data.get(0, 0)
-            elif isinstance(zone_data, list) and len(zone_data) > 0:
-                conn.zone_id = zone_data[0] if not isinstance(zone_data[0], dict) else zone_data[0].get(0, 0)
-            else: 
-                conn.zone_id = zone_data or 0
-        else:
-            return "UNKNOWN", device_id
-
-        conn.send_data(5, SDP({
-            0: conn.account_id, 1: conn.session_key, 2: conn.client_version,
-            5: conn.zone_id, 6: conn.channel
-        }))
-
-        pkt_id, res = conn.recv_data()
-        banned, ban_info = inspect_for_ban(pkt_id, res)
-        if banned: 
-            return "BANNED", format_ban_string(device_id, ban_info)
-
-        if pkt_id == 6 and res:
-            game_server = res[1]
-            conn.game_server_host, conn.game_server_port = game_server.split(':')
-            conn.game_server_port = int(conn.game_server_port)
-        else:
-            return "UNKNOWN", device_id
-
-        conn.cleanup()
-        conn.connect(conn.game_server_host, conn.game_server_port)
-
-        conn.send_data(10001, SDP({
-            0: conn.account_id, 1: conn.session_key, 2: conn.zone_id,
-            4: conn.client_version, 13: conn.channel, 15: conn.device_id
-        }))
-        conn.send_data(10101, SDP({0: 0, 2: 2}))
-
-        role_requested = False
-        while True:
-            pkt_id, res = conn.recv_data()
-            banned, ban_info = inspect_for_ban(pkt_id, res)
-            
-            if banned:
-                return "BANNED", format_ban_string(device_id, ban_info)
-
-            if pkt_id is None or pkt_id == -1:
-                return "UNKNOWN", device_id
-            elif pkt_id == 10002 and not role_requested:
-                conn.send_data(10003, SDP({
-                    0: conn.account_id, 1: conn.session_key, 2: conn.zone_id,
-                    3: conn.client_version, 4: conn.channel, 5: conn.device_id
-                }))
-                role_requested = True
-            elif pkt_id in (10004, 10008):
-                return "CLEAN", device_id
-    except Exception as e:
-        logger.error(f"Ban check error for {device_id}: {e}")
-        return "UNKNOWN", device_id
-    finally:
-        conn.cleanup()
-
-
-async def check_ban_async(device_id: str) -> Tuple[str, str]:
-    """Async wrapper for ban check."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, check_device_ban_silent, device_id)
-
-
-# ==================== MAIN BOT CLASS ====================
-
 key_manager = KeyManager()
 
 
@@ -1301,7 +1463,7 @@ class MLBBBot:
             "/start — Main menu\n"
             "/redeem <KEY> — Activate key\n"
             "/check <device_id> — Check single device ID\n"
-            "/bancheck <device_id> — Check ban status\n"
+            "/bancheck <device_id> — Check if device is banned\n"
             "/help — Show this\n"
         )
         if is_admin:
@@ -1315,10 +1477,8 @@ class MLBBBot:
             )
         await update.message.reply_text(help_text)
 
-    # ==================== BAN CHECK COMMAND ====================
-
-    async def bancheck_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check ban status of a device ID."""
+    async def check_ban_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check if a device ID is banned"""
         user_id = update.effective_user.id
         
         if not self._check_access(user_id):
@@ -1360,49 +1520,48 @@ class MLBBBot:
         status_msg = await update.message.reply_text(
             f"🔍 **Checking Ban Status...**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Device: `{device_id}`\n\n"
-            f"⏳ Connecting to servers...",
+            f"🔑 **DevID:** `{device_id[:20]}...{device_id[-10:]}`\n\n"
+            f"⏳ Connecting to server...",
             parse_mode='Markdown'
         )
         
         try:
-            status, result = await check_ban_async(device_id)
+            # Run the ban check in a thread pool since it's synchronous
+            loop = asyncio.get_event_loop()
+            status, ban_info = await loop.run_in_executor(None, check_device_ban_silent, device_id)
             
             if status == "BANNED":
                 response = (
-                    f"🚫 **BANNED DEVICE**\n"
+                    f"🚫 **Device is BANNED!**\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📱 Device: `{device_id[:20]}...{device_id[-10:]}`\n\n"
-                    f"🔒 **Status:** BANNED\n"
-                    f"📋 **Details:** {result}\n\n"
+                    f"🔑 **DevID:** `{device_id[:20]}...{device_id[-10:]}`\n\n"
+                    f"{format_ban_info(ban_info)}\n\n"
                     f"⚠️ This device/account has been banned from the game."
                 )
+                await status_msg.edit_text(response, parse_mode='Markdown')
+                
             elif status == "CLEAN":
                 response = (
-                    f"✅ **CLEAN DEVICE**\n"
+                    f"✅ **Device is CLEAN**\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📱 Device: `{device_id[:20]}...{device_id[-10:]}`\n\n"
-                    f"🔓 **Status:** CLEAN / ACTIVE\n\n"
+                    f"🔑 **DevID:** `{device_id[:20]}...{device_id[-10:]}`\n\n"
                     f"✅ No ban detected for this device/account."
                 )
-            else:
+                await status_msg.edit_text(response, parse_mode='Markdown')
+                
+            else:  # UNKNOWN
                 response = (
-                    f"❓ **UNKNOWN STATUS**\n"
+                    f"❌ **Unable to Check Ban Status**\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📱 Device: `{device_id[:20]}...{device_id[-10:]}`\n\n"
-                    f"❓ **Status:** Unknown\n\n"
-                    f"Could not determine ban status. This may be due to:\n"
-                    f"• Invalid device ID\n"
-                    f"• Server connection issues\n"
-                    f"• Account not registered"
+                    f"🔑 **DevID:** `{device_id[:20]}...{device_id[-10:]}`\n\n"
+                    f"Could not determine ban status.\n\n"
+                    f"**Possible reasons:**\n"
+                    f"• Device ID is invalid\n"
+                    f"• Account is not registered\n"
+                    f"• Server is temporarily unavailable"
                 )
-            
-            # Add to stats
-            if user_id in self.live_stats:
-                self.live_stats[user_id].add_ban_result(status)
-            
-            await status_msg.edit_text(response, parse_mode='Markdown')
-            
+                await status_msg.edit_text(response, parse_mode='Markdown')
+                
         except Exception as e:
             logger.error(f"Ban check error: {e}")
             await status_msg.edit_text(
@@ -1412,7 +1571,26 @@ class MLBBBot:
                 f"Please try again later."
             )
 
-    # ==================== CHECK SINGLE (With Ban Info) ====================
+    async def check_ban_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle the check_ban callback"""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self._check_access(user_id):
+            await query.answer("❌ No access. /redeem <KEY>", show_alert=True)
+            return
+        
+        await query.answer()
+        await query.edit_message_text(
+            "🚫 **Check Ban Status**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Send the device ID you want to check for bans.\n\n"
+            "**Usage:** `/bancheck <device_id>`\n\n"
+            "**Example:**\n"
+            "`/bancheck and_1234567890abcdef1234567890abcdef12345678`",
+            parse_mode='Markdown'
+        )
+        context.user_data['mode'] = 'ban_check'
 
     async def check_single(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the check_single callback"""
@@ -1429,37 +1607,13 @@ class MLBBBot:
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "Send the device ID you want to check.\n\n"
             "Example: `and_1234567890abcdef1234567890abcdef12345678`\n\n"
-            "You can also use:\n"
-            "• `/check <device_id>` - Full info\n"
-            "• `/bancheck <device_id>` - Ban status only",
+            "You can also use: `/check <device_id>`",
             parse_mode='Markdown'
         )
         context.user_data['mode'] = 'single_check'
 
-    async def check_ban_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the check_ban callback"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        
-        if not self._check_access(user_id):
-            await query.answer("❌ No access. /redeem <KEY>", show_alert=True)
-            return
-        
-        await query.answer()
-        await query.edit_message_text(
-            "🚫 **Check Ban Status**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Send the device ID to check for bans.\n\n"
-            "Example: `and_1234567890abcdef1234567890abcdef12345678`\n\n"
-            "You can also use: `/bancheck <device_id>`",
-            parse_mode='Markdown'
-        )
-        context.user_data['mode'] = 'ban_check'
-
-    # ==================== CHECK COMMAND ====================
-
     async def check_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check a single device ID with full info"""
+        """Check a single device ID"""
         user_id = update.effective_user.id
         
         if not self._check_access(user_id):
@@ -1484,7 +1638,8 @@ class MLBBBot:
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "**Usage:** `/check <device_id>`\n\n"
                 "**Example:**\n"
-                "`/check and_1234567890abcdef1234567890abcdef12345678`",
+                "`/check and_1234567890abcdef1234567890abcdef12345678`\n\n"
+                "**Tip:** You can also reply to a message containing a device ID.",
                 parse_mode='Markdown'
             )
             return
@@ -1492,6 +1647,7 @@ class MLBBBot:
         if len(device_id) < 40:
             await update.message.reply_text(
                 "❌ **Invalid Device ID**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"ID: `{device_id}`\n\n"
                 "Device ID must be at least 40 characters long.",
                 parse_mode='Markdown'
@@ -1499,13 +1655,13 @@ class MLBBBot:
             return
         
         if user_id in self.active_tasks and not self.active_tasks[user_id]['done']:
-            await update.message.reply_text("⏳ A task is already running. Please wait.")
+            await update.message.reply_text("⏳ A task is already running. Please wait for it to complete.")
             return
         
         status_msg = await update.message.reply_text(
             f"🔍 **Checking Device ID...**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"`{device_id}`\n\n"
+            f"🔑 **DevID:** `{device_id[:20]}...{device_id[-10:]}`\n\n"
             f"⏳ Connecting to server...",
             parse_mode='Markdown'
         )
@@ -1514,21 +1670,12 @@ class MLBBBot:
             sem = asyncio.Semaphore(1)
             bucket = _Bucket(1)
             start_time = time.monotonic()
-            
-            # Run both checks in parallel
-            check_task = asyncio.create_task(_check(device_id, sem, bucket))
-            ban_task = asyncio.create_task(check_ban_async(device_id))
-            
-            result, (ban_status, ban_result) = await asyncio.gather(check_task, ban_task)
+            result = await _check(device_id, sem, bucket)
             elapsed = time.monotonic() - start_time
             
             if result and result.get('player'):
                 player = result['player']
                 prev_heroes = ", ".join(player["prev_heroes"]) if player["prev_heroes"] else "N/A"
-                
-                # Ban status indicator
-                ban_indicator = "🚫 BANNED" if ban_status == "BANNED" else "✅ CLEAN" if ban_status == "CLEAN" else "❓ UNKNOWN"
-                ban_emoji = "🔴" if ban_status == "BANNED" else "🟢" if ban_status == "CLEAN" else "🟡"
                 
                 response = (
                     f"✅ **Valid Device ID**\n"
@@ -1536,8 +1683,6 @@ class MLBBBot:
                     f"📱 **Account:** `{result['acc']}`\n"
                     f"🌍 **Zone:** `{result['zone']}`\n"
                     f"🔑 **DevID:** `{result['did'][:20]}...{result['did'][-10:]}`\n\n"
-                    f"{ban_emoji} **Ban Status:** {ban_indicator}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"👤 **Name:** {player['nickname']}\n"
                     f"📊 **Level:** {player['level']}\n"
                     f"🏆 **Rank:** {player['current_rank']}\n"
@@ -1561,40 +1706,30 @@ class MLBBBot:
                 
                 if user_id in self.live_stats:
                     self.live_stats[user_id].add_hit(result)
-                    self.live_stats[user_id].add_ban_result(ban_status)
                 
             elif result:
-                # Account exists but no player info
-                ban_indicator = "🚫 BANNED" if ban_status == "BANNED" else "✅ CLEAN" if ban_status == "CLEAN" else "❓ UNKNOWN"
-                ban_emoji = "🔴" if ban_status == "BANNED" else "🟢" if ban_status == "CLEAN" else "🟡"
-                
                 response = (
                     f"⚠️ **Partial Result**\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📱 **Account:** `{result['acc']}`\n"
                     f"🌍 **Zone:** `{result['zone']}`\n"
                     f"🔑 **DevID:** `{result['did'][:20]}...{result['did'][-10:]}`\n\n"
-                    f"{ban_emoji} **Ban Status:** {ban_indicator}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"❌ **Player Info:** Not available\n"
                     f"⏱️ **Check Time:** {elapsed:.2f}s"
                 )
                 await status_msg.edit_text(response, parse_mode='Markdown')
             else:
-                # No result
-                ban_indicator = "🚫 BANNED" if ban_status == "BANNED" else "✅ CLEAN" if ban_status == "CLEAN" else "❓ UNKNOWN"
-                ban_emoji = "🔴" if ban_status == "BANNED" else "🟢" if ban_status == "CLEAN" else "🟡"
-                
-                response = (
+                await status_msg.edit_text(
                     f"❌ **Invalid or Unregistered Device ID**\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"🔑 **DevID:** `{device_id[:20]}...{device_id[-10:]}`\n\n"
-                    f"{ban_emoji} **Ban Status:** {ban_indicator}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"⏱️ **Check Time:** {elapsed:.2f}s\n\n"
-                    f"💡 The device ID may be invalid or not registered."
+                    f"💡 The device ID may be invalid or not registered in the game.\n\n"
+                    f"**Possible reasons:**\n"
+                    f"• Device ID is incorrect\n"
+                    f"• Account is not registered\n"
+                    f"• Server is temporarily unavailable"
                 )
-                await status_msg.edit_text(response, parse_mode='Markdown')
                 
         except Exception as e:
             logger.error(f"Check command error: {e}")
@@ -1605,8 +1740,6 @@ class MLBBBot:
                 f"Please try again later."
             )
 
-    # ==================== FILE CHECK ====================
-
     async def check_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not self._check_access(user_id):
@@ -1616,10 +1749,7 @@ class MLBBBot:
             await update.callback_query.answer("Task running!", show_alert=True)
             return
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            "📁 Send .txt file with device IDs (one per line).\n\n"
-            "⚠️ The bot will check both account info AND ban status."
-        )
+        await update.callback_query.edit_message_text("📁 Send .txt file with device IDs (one per line).")
         context.user_data['mode'] = 'file'
 
     async def generate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1738,8 +1868,6 @@ class MLBBBot:
         keyboard = [[InlineKeyboardButton("◀ Back", callback_data="admin_panel")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # ==================== HANDLE MESSAGE ====================
-
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         
@@ -1750,9 +1878,9 @@ class MLBBBot:
                 return
             device_id = update.message.text.strip()
             context.user_data['mode'] = None
-            # Create a fake context with args for bancheck
+            # Simulate /bancheck command
             context.args = [device_id]
-            await self.bancheck_cmd(update, context)
+            await self.check_ban_cmd(update, context)
             return
         
         # Handle single check mode
@@ -1801,7 +1929,69 @@ class MLBBBot:
             context.user_data['mode'] = None
             asyncio.create_task(self.run_check_task(update, context, ids, 'file'))
 
-    # ==================== RUN TASK ====================
+    async def process_single_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
+        """Process a single device ID check (called from handle_message)"""
+        user_id = update.effective_user.id
+        
+        if len(device_id) < 40:
+            await update.message.reply_text(
+                "❌ **Invalid Device ID**\n"
+                f"ID: `{device_id}`\n\n"
+                "Device ID must be at least 40 characters long.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        status_msg = await update.message.reply_text(
+            f"🔍 **Checking Device ID...**\n"
+            f"`{device_id}`",
+            parse_mode='Markdown'
+        )
+        
+        try:
+            sem = asyncio.Semaphore(1)
+            bucket = _Bucket(1)
+            start_time = time.monotonic()
+            result = await _check(device_id, sem, bucket)
+            elapsed = time.monotonic() - start_time
+            
+            if result and result.get('player'):
+                player = result['player']
+                prev_heroes = ", ".join(player["prev_heroes"]) if player["prev_heroes"] else "N/A"
+                
+                response = (
+                    f"✅ **Valid Device ID**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📱 **Account:** `{result['acc']}`\n"
+                    f"🌍 **Zone:** `{result['zone']}`\n\n"
+                    f"👤 **Name:** {player['nickname']}\n"
+                    f"📊 **Level:** {player['level']}\n"
+                    f"🏆 **Rank:** {player['current_rank']}\n"
+                    f"⭐ **Highest Rank:** {player['high_rank']}\n"
+                    f"🎨 **Skins:** {player['skin_count']:,}\n"
+                    f"🦸 **Heroes:** {player['hero_count']:,}\n"
+                    f"⚔️ **Battles:** {player['total_battles']:,}\n"
+                    f"📈 **Win Rate:** {player['win_rate']}\n"
+                    f"🎯 **Last Hero:** {player['last_hero']}\n"
+                    f"📜 **Recent Heroes:** {prev_heroes}\n"
+                    f"🛡️ **Squad:** {player['squad']}\n"
+                    f"💎 **Collector:** {player['collector_tier']}\n"
+                    f"❤️ **Affinity:** {player['affinity']}\n"
+                    f"⏰ **Last Login:** {player['last_login']}\n"
+                    f"🌐 **Country:** {player['last_login_country']}\n"
+                    f"📅 **Registered:** {player['create_country']}\n"
+                    f"⏱️ **Check Time:** {elapsed:.2f}s"
+                )
+                await status_msg.edit_text(response, parse_mode='Markdown')
+            else:
+                await status_msg.edit_text(
+                    f"❌ **Invalid or Unregistered Device ID**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"⏱️ **Check Time:** {elapsed:.2f}s"
+                )
+        except Exception as e:
+            logger.error(f"Single check error: {e}")
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
 
     async def run_check_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE, data, mode: str):
         user_id = update.effective_user.id
@@ -1811,8 +2001,6 @@ class MLBBBot:
         self.live_stats[user_id] = stats
         status_msg = None
         stats_msg = None
-        ban_results = {"BANNED": [], "CLEAN": [], "UNKNOWN": []}
-        
         try:
             if mode == 'generate':
                 ids = [_gen() for _ in range(data)]
@@ -1820,7 +2008,6 @@ class MLBBBot:
             else:
                 ids = data[:]
                 limit = len(ids)
-            
             concurrency = 80
             rate = 80
             sem = asyncio.Semaphore(concurrency)
@@ -1838,26 +2025,20 @@ class MLBBBot:
                 if self.active_tasks[user_id]['cancelled']:
                     return
                 res = await _check(did, sem, bucket)
-                # Also check ban status
-                ban_status, ban_result = await check_ban_async(did)
                 async with lock:
                     checked += 1
                     if res:
                         valid += 1
-                        res['ban_status'] = ban_status
-                        res['ban_result'] = ban_result
                         results.append(res)
                         stats.add_hit(res)
-                        stats.add_ban_result(ban_status)
-                        if ban_status == "BANNED":
-                            ban_results["BANNED"].append(f"{did} | {ban_result}")
-                        elif ban_status == "CLEAN":
-                            ban_results["CLEAN"].append(did)
-                        else:
-                            ban_results["UNKNOWN"].append(did)
                     else:
                         failed += 1
                         stats.add_unreg()
+                    # Also check ban status for each valid ID
+                    if res:
+                        loop = asyncio.get_event_loop()
+                        status, _ = await loop.run_in_executor(None, check_device_ban_silent, did)
+                        stats.add_ban_result(status)
 
             tasks = [asyncio.create_task(worker(did)) for did in ids]
             while not all(t.done() for t in tasks) and not self.active_tasks[user_id]['cancelled']:
@@ -1876,7 +2057,6 @@ class MLBBBot:
                         f"⚡ [{bar}] {progress:.1f}%\n\n"
                         f"✅ {checked:,}/{limit:,} | 🟢 {valid:,}\n"
                         f"❌ {failed:,} | ⚡ {speed:.1f}/s\n"
-                        f"🔴 Banned: {stats.banned:,} | 🟢 Clean: {stats.clean:,}\n"
                         f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s | ⏳ {eta_m}m {eta_s}s\n"
                     )
                     stats_text = stats.format()
@@ -1900,31 +2080,11 @@ class MLBBBot:
             self.active_tasks[user_id]['done'] = True
             elapsed = time.monotonic() - start_time
 
-            # Generate output files
             if results:
-                # Main results file
                 output_file = f"{valid}DevId_Valid.txt"
                 with open(output_file, 'w', encoding='utf-8') as f:
                     for res in results:
                         f.write(format_result_line(res) + "\n")
-                
-                # Ban results file
-                ban_file = f"ban_results_{int(time.time())}.txt"
-                with open(ban_file, 'w', encoding='utf-8') as f:
-                    f.write("=== BANNED DEVICES ===\n\n")
-                    for item in ban_results["BANNED"]:
-                        f.write(item + "\n")
-                    f.write(f"\nTotal Banned: {len(ban_results['BANNED'])}\n\n")
-                    f.write("=== CLEAN DEVICES ===\n\n")
-                    for item in ban_results["CLEAN"]:
-                        f.write(item + "\n")
-                    f.write(f"\nTotal Clean: {len(ban_results['CLEAN'])}\n\n")
-                    f.write("=== UNKNOWN STATUS ===\n\n")
-                    for item in ban_results["UNKNOWN"]:
-                        f.write(item + "\n")
-                    f.write(f"\nTotal Unknown: {len(ban_results['UNKNOWN'])}")
-                
-                # Send files
                 with open(output_file, 'rb') as f:
                     await context.bot.send_document(
                         chat_id, f,
@@ -1932,14 +2092,6 @@ class MLBBBot:
                         caption=f"✅ Found {len(results):,} valid IDs!"
                     )
                 os.remove(output_file)
-                
-                with open(ban_file, 'rb') as f:
-                    await context.bot.send_document(
-                        chat_id, f,
-                        filename=ban_file,
-                        caption=f"🔒 Ban check results:\nBanned: {len(ban_results['BANNED'])}\nClean: {len(ban_results['CLEAN'])}\nUnknown: {len(ban_results['UNKNOWN'])}"
-                    )
-                os.remove(ban_file)
             else:
                 await context.bot.send_message(chat_id, "❌ No valid IDs found.")
 
@@ -1949,9 +2101,6 @@ class MLBBBot:
                 f"Total checked : {checked:,}\n"
                 f"Valid found   : {valid:,}\n"
                 f"Failed        : {failed:,}\n"
-                f"🔴 Banned     : {stats.banned:,}\n"
-                f"🟢 Clean      : {stats.clean:,}\n"
-                f"❓ Unknown    : {stats.unknown:,}\n"
                 f"Success rate  : {(valid / checked * 100) if checked > 0 else 0:.2f}%\n"
                 f"Total time    : {int(elapsed // 60)}m {int(elapsed % 60)}s\n"
                 f"Avg speed     : {checked / elapsed:.1f}/s\n"
@@ -1982,8 +2131,6 @@ class MLBBBot:
         finally:
             self.active_tasks[user_id]['done'] = True
             self.live_stats.pop(user_id, None)
-
-    # ==================== BUTTON CALLBACK ====================
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -2070,15 +2217,13 @@ class MLBBBot:
             )
 
 
-# ==================== MAIN ====================
-
 def main():
     bot = MLBBBot()
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("help", bot.help))
     application.add_handler(CommandHandler("check", bot.check_cmd))
-    application.add_handler(CommandHandler("bancheck", bot.bancheck_cmd))  # New command
+    application.add_handler(CommandHandler("bancheck", bot.check_ban_cmd))  # New ban check command
     application.add_handler(CommandHandler("redeem", bot.redeem_cmd))
     application.add_handler(CommandHandler("genkey", bot.genkey_cmd))
     application.add_handler(CommandHandler("listkeys", bot.listkeys_cmd))
@@ -2088,7 +2233,7 @@ def main():
     application.add_handler(CallbackQueryHandler(bot.button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(MessageHandler(filters.Document.ALL, bot.handle_message))
-    print("MLBB Bot started with Ban Checker integration!")
+    print("MLBB Bot started!")
     print("Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
