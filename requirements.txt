@@ -1,4 +1,4 @@
 python-telegram-bot==20.7
 pycryptodome==3.20.0
 zstandard==0.23.0
-cffi==1.16.0
+cffi>=1.17.1  # Updated for Python 3.13 support
