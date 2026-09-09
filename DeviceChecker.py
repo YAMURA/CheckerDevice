@@ -939,7 +939,6 @@ class MLBBBot:
         if has_access or is_admin:
             keyboard.append([InlineKeyboardButton("📁 Check from File", callback_data="check_file")])
             keyboard.append([InlineKeyboardButton("🎲 Generate & Check", callback_data="generate")])
-            keyboard.append([InlineKeyboardButton("🔍 Check Single ID", callback_data="check_single")])
         if not has_access and not is_admin:
             welcome_msg += "You need an access key to use this bot.\nUse /redeem <KEY> to activate."
         if is_admin:
@@ -1039,7 +1038,6 @@ class MLBBBot:
             "Commands:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "/start — Main menu\n"
             "/redeem <KEY> — Activate key\n"
-            "/check <device_id> — Check single device ID\n"
             "/help — Show this\n"
         )
         if is_admin:
@@ -1052,170 +1050,6 @@ class MLBBBot:
                 "/delkey <KEY> — Delete key\n"
             )
         await update.message.reply_text(help_text)
-
-    async def check_single(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the check_single callback"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        
-        if not self._check_access(user_id):
-            await query.answer("❌ No access. /redeem <KEY>", show_alert=True)
-            return
-        
-        await query.answer()
-        await query.edit_message_text(
-            "🔍 **Check Single Device ID**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Send the device ID you want to check.\n\n"
-            "Example: `and_1234567890abcdef1234567890abcdef12345678`\n\n"
-            "You can also use: `/check <device_id>`",
-            parse_mode='Markdown'
-        )
-        context.user_data['mode'] = 'single_check'
-
-    async def check_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check a single device ID"""
-        user_id = update.effective_user.id
-        
-        # Check access
-        if not self._check_access(user_id):
-            await update.message.reply_text("❌ No access. Use /redeem <KEY> to activate.")
-            return
-        
-        # Check if user provides an ID
-        device_id = None
-        
-        if context.args:
-            device_id = context.args[0].strip()
-        elif update.message.reply_to_message:
-            # Check if replying to a message with an ID
-            replied_text = update.message.reply_to_message.text
-            if replied_text:
-                # Try to extract a device ID from the replied message
-                words = replied_text.split()
-                for word in words:
-                    # Look for something that looks like a device ID
-                    if len(word) >= 40 and ('_' in word or word.startswith('and_')):
-                        device_id = word.strip()
-                        break
-        
-        if not device_id:
-            await update.message.reply_text(
-                "❌ **No Device ID Provided**\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "**Usage:** `/check <device_id>`\n\n"
-                "**Example:**\n"
-                "`/check and_1234567890abcdef1234567890abcdef12345678`\n\n"
-                "**Tip:** You can also reply to a message containing a device ID.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Validate device ID format (basic check)
-        if len(device_id) < 40:
-            await update.message.reply_text(
-                "❌ **Invalid Device ID**\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"ID: `{device_id}`\n\n"
-                "Device ID must be at least 40 characters long.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Check if a task is already running for this user
-        if user_id in self.active_tasks and not self.active_tasks[user_id]['done']:
-            await update.message.reply_text("⏳ A task is already running. Please wait for it to complete.")
-            return
-        
-        # Send initial message
-        status_msg = await update.message.reply_text(
-            f"🔍 **Checking Device ID...**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"`{device_id}`\n\n"
-            f"⏳ Connecting to server...",
-            parse_mode='Markdown'
-        )
-        
-        try:
-            # Create semaphore and bucket for single check
-            sem = asyncio.Semaphore(1)
-            bucket = _Bucket(1)
-            
-            # Perform the check
-            start_time = time.monotonic()
-            result = await _check(device_id, sem, bucket)
-            elapsed = time.monotonic() - start_time
-            
-            if result and result.get('player'):
-                # Format the result
-                player = result['player']
-                prev_heroes = ", ".join(player["prev_heroes"]) if player["prev_heroes"] else "N/A"
-                
-                response = (
-                    f"✅ **Valid Device ID**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📱 **Account:** `{result['acc']}`\n"
-                    f"🌍 **Zone:** `{result['zone']}`\n"
-                    f"🔑 **DevID:** `{result['did'][:20]}...{result['did'][-10:]}`\n\n"
-                    f"👤 **Name:** {player['nickname']}\n"
-                    f"📊 **Level:** {player['level']}\n"
-                    f"🏆 **Rank:** {player['current_rank']}\n"
-                    f"⭐ **Highest Rank:** {player['high_rank']}\n"
-                    f"🎨 **Skins:** {player['skin_count']:,}\n"
-                    f"🦸 **Heroes:** {player['hero_count']:,}\n"
-                    f"⚔️ **Battles:** {player['total_battles']:,}\n"
-                    f"📈 **Win Rate:** {player['win_rate']}\n"
-                    f"🎯 **Last Hero:** {player['last_hero']}\n"
-                    f"📜 **Recent Heroes:** {prev_heroes}\n"
-                    f"🛡️ **Squad:** {player['squad']}\n"
-                    f"💎 **Collector:** {player['collector_tier']}\n"
-                    f"❤️ **Affinity:** {player['affinity']}\n"
-                    f"⏰ **Last Login:** {player['last_login']}\n"
-                    f"🌐 **Country:** {player['last_login_country']}\n"
-                    f"📅 **Registered:** {player['create_country']}\n"
-                    f"⏱️ **Check Time:** {elapsed:.2f}s"
-                )
-                
-                await status_msg.edit_text(response, parse_mode='Markdown')
-                
-                # Add to live stats if available
-                if user_id in self.live_stats:
-                    self.live_stats[user_id].add_hit(result)
-                
-            elif result:
-                # Account exists but no player info
-                response = (
-                    f"⚠️ **Partial Result**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📱 **Account:** `{result['acc']}`\n"
-                    f"🌍 **Zone:** `{result['zone']}`\n"
-                    f"🔑 **DevID:** `{result['did'][:20]}...{result['did'][-10:]}`\n\n"
-                    f"❌ **Player Info:** Not available\n"
-                    f"⏱️ **Check Time:** {elapsed:.2f}s"
-                )
-                await status_msg.edit_text(response, parse_mode='Markdown')
-            else:
-                # No result
-                await status_msg.edit_text(
-                    f"❌ **Invalid or Unregistered Device ID**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"🔑 **DevID:** `{device_id[:20]}...{device_id[-10:]}`\n\n"
-                    f"⏱️ **Check Time:** {elapsed:.2f}s\n\n"
-                    f"💡 The device ID may be invalid or not registered in the game.\n\n"
-                    f"**Possible reasons:**\n"
-                    f"• Device ID is incorrect\n"
-                    f"• Account is not registered\n"
-                    f"• Server is temporarily unavailable"
-                )
-                
-        except Exception as e:
-            logger.error(f"Check command error: {e}")
-            await status_msg.edit_text(
-                f"❌ **Error Checking Device ID**\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Error: `{str(e)}`\n\n"
-                f"Please try again later."
-            )
 
     async def check_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -1347,19 +1181,6 @@ class MLBBBot:
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        
-        # Handle single check mode
-        if context.user_data.get('mode') == 'single_check' and update.message.text:
-            if not self._check_access(user_id):
-                await update.message.reply_text("❌ No access. /redeem <KEY>")
-                return
-            
-            device_id = update.message.text.strip()
-            context.user_data['mode'] = None
-            # Process the check
-            await self.process_single_check(update, context, device_id)
-            return
-        
         if context.user_data.get('mode') == 'generate' and update.message.text:
             if not self._check_access(user_id):
                 await update.message.reply_text("❌ No access. /redeem <KEY>")
@@ -1394,70 +1215,6 @@ class MLBBBot:
             await status_msg.edit_text(f"✅ Loaded {len(ids):,} IDs. Starting...")
             context.user_data['mode'] = None
             asyncio.create_task(self.run_check_task(update, context, ids, 'file'))
-
-    async def process_single_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
-        """Process a single device ID check (called from handle_message)"""
-        user_id = update.effective_user.id
-        
-        if len(device_id) < 40:
-            await update.message.reply_text(
-                "❌ **Invalid Device ID**\n"
-                f"ID: `{device_id}`\n\n"
-                "Device ID must be at least 40 characters long.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        status_msg = await update.message.reply_text(
-            f"🔍 **Checking Device ID...**\n"
-            f"`{device_id}`",
-            parse_mode='Markdown'
-        )
-        
-        try:
-            sem = asyncio.Semaphore(1)
-            bucket = _Bucket(1)
-            start_time = time.monotonic()
-            result = await _check(device_id, sem, bucket)
-            elapsed = time.monotonic() - start_time
-            
-            if result and result.get('player'):
-                player = result['player']
-                prev_heroes = ", ".join(player["prev_heroes"]) if player["prev_heroes"] else "N/A"
-                
-                response = (
-                    f"✅ **Valid Device ID**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📱 **Account:** `{result['acc']}`\n"
-                    f"🌍 **Zone:** `{result['zone']}`\n\n"
-                    f"👤 **Name:** {player['nickname']}\n"
-                    f"📊 **Level:** {player['level']}\n"
-                    f"🏆 **Rank:** {player['current_rank']}\n"
-                    f"⭐ **Highest Rank:** {player['high_rank']}\n"
-                    f"🎨 **Skins:** {player['skin_count']:,}\n"
-                    f"🦸 **Heroes:** {player['hero_count']:,}\n"
-                    f"⚔️ **Battles:** {player['total_battles']:,}\n"
-                    f"📈 **Win Rate:** {player['win_rate']}\n"
-                    f"🎯 **Last Hero:** {player['last_hero']}\n"
-                    f"📜 **Recent Heroes:** {prev_heroes}\n"
-                    f"🛡️ **Squad:** {player['squad']}\n"
-                    f"💎 **Collector:** {player['collector_tier']}\n"
-                    f"❤️ **Affinity:** {player['affinity']}\n"
-                    f"⏰ **Last Login:** {player['last_login']}\n"
-                    f"🌐 **Country:** {player['last_login_country']}\n"
-                    f"📅 **Registered:** {player['create_country']}\n"
-                    f"⏱️ **Check Time:** {elapsed:.2f}s"
-                )
-                await status_msg.edit_text(response, parse_mode='Markdown')
-            else:
-                await status_msg.edit_text(
-                    f"❌ **Invalid or Unregistered Device ID**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"⏱️ **Check Time:** {elapsed:.2f}s"
-                )
-        except Exception as e:
-            logger.error(f"Single check error: {e}")
-            await status_msg.edit_text(f"❌ Error: {str(e)}")
 
     async def run_check_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE, data, mode: str):
         user_id = update.effective_user.id
@@ -1600,8 +1357,6 @@ class MLBBBot:
 
         if data == "check_file":
             await self.check_file(update, context)
-        elif data == "check_single":
-            await self.check_single(update, context)
         elif data == "generate":
             await self.generate(update, context)
         elif data == "my_status":
@@ -1629,7 +1384,6 @@ class MLBBBot:
             if has_access or is_admin:
                 keyboard.append([InlineKeyboardButton("📁 Check from File", callback_data="check_file")])
                 keyboard.append([InlineKeyboardButton("🎲 Generate & Check", callback_data="generate")])
-                keyboard.append([InlineKeyboardButton("🔍 Check Single ID", callback_data="check_single")])
             if is_admin:
                 keyboard.append([InlineKeyboardButton("🔑 Admin Panel", callback_data="admin_panel")])
             keyboard.append([InlineKeyboardButton("📋 My Status", callback_data="my_status")])
@@ -1680,7 +1434,6 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("help", bot.help))
-    application.add_handler(CommandHandler("check", bot.check_cmd))  # Added /check command
     application.add_handler(CommandHandler("redeem", bot.redeem_cmd))
     application.add_handler(CommandHandler("genkey", bot.genkey_cmd))
     application.add_handler(CommandHandler("listkeys", bot.listkeys_cmd))
