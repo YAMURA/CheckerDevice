@@ -3377,14 +3377,14 @@ async def handle_bf_custom_delay(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
         return
-    
+
     doc = update.message.document
     if not doc.file_name.endswith('.txt'):
         await update.message.reply_text("❌ Only .txt files are supported!")
         return
-    
+
     user_id = update.effective_user.id
-    
+
     active_jobs = get_user_active_jobs(user_id)
     if active_jobs and not is_admin(user_id):
         await update.message.reply_text(
@@ -3394,38 +3394,45 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         return
-    
+
     status_msg = await update.message.reply_text("⏳ Downloading file...")
-    
+
     try:
         file = await doc.get_file()
         session_id = f"bulk_{int(time.time())}"
         session_dir = os.path.join(OUTPUT_DIR, "bulk_sessions", session_id)
         os.makedirs(session_dir, exist_ok=True)
-        
+
         file_path = os.path.join(session_dir, "input_devices.txt")
         await file.download_to_drive(file_path)
-        
+
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            devices = [l.strip() for l in f if l.strip()]
-        
+            devices = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_devices = []
+        for d in devices:
+            if d not in seen:
+                seen.add(d)
+                unique_devices.append(d)
+        devices = unique_devices
+
         if not devices:
             await status_msg.edit_text("❌ No device IDs found in file!")
             return
-        
+
         if len(devices) > MAX_BULK_DEVICES:
             await status_msg.edit_text(
                 f"❌ Too many devices! Max {MAX_BULK_DEVICES:,} per file.\n"
                 f"Found: {len(devices):,}"
             )
             return
-        
+
         create_bulk_job(user_id, len(devices), session_id)
-        
-        # Per-user persistent files (visible in "My Files")
+
         ufiles = get_user_files(user_id)
-        
-        # Job session files (uploaded at end)
+
         session_files = {
             "all_hits_detail": os.path.join(session_dir, "all_hits_detail.txt"),
             "raw_devices_detail": os.path.join(session_dir, "raw_devices_detail.txt"),
@@ -3440,15 +3447,19 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "epic": os.path.join(session_dir, "epic_hits.txt"),
             "legend": os.path.join(session_dir, "legend_hits.txt"),
             "mythic": os.path.join(session_dir, "mythic_hits.txt"),
+            "errors_log": os.path.join(session_dir, "errors.txt"),
         }
-        
+
         for fpath in session_files.values():
             with open(fpath, 'w', encoding='utf-8') as f:
                 pass
-        
+
+        # Thread-safe stats
+        stats_lock = threading.Lock()
         stats = {
             "total": len(devices), "processed": 0, "hits": 0, "info": 0,
             "no_info": 0, "unreg": 0, "banned": 0, "failed": 0,
+            "dead": 0, "detail_fail": 0,
             "level_1_30": 0, "level_31_50": 0, "level_51_99": 0, "level_100_plus": 0,
             "skin_1_50": 0, "skin_51_99": 0, "skin_100_250": 0,
             "skin_251_300": 0, "skin_301_400": 0, "skin_400_plus": 0,
@@ -3456,261 +3467,184 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "rank_epic": 0, "rank_legend": 0, "rank_mythic": 0,
             "start_time": time.time()
         }
-        
+
+        file_write_lock = threading.Lock()
+
+        def write_safe(path, text):
+            with file_write_lock:
+                with open(path, "a", encoding='utf-8') as f:
+                    f.write(text)
+
         def save_account_session(account_info: dict, player_data: dict):
-            """Write to both session folder (for upload) AND user folder (for My Files)."""
             device = account_info.get('Device id', '')
             acc, zone = account_info.get('role_id', '?'), account_info.get('zone_id', '?')
             ban_stat = player_data.get('ban_status', 'NORMAL')
             is_banned = 'ban' in str(ban_stat).lower()
-            
+
             if is_banned:
-                with open(session_files["banned_accounts"], "a", encoding='utf-8') as f:
-                    f.write(f"{device} | {acc}:{zone} | {ban_stat}\n")
-                with open(ufiles["banned_accounts"], "a", encoding='utf-8') as f:
-                    f.write(f"{device} | {acc}:{zone} | {ban_stat}\n")
+                line = f"{device} | {acc}:{zone} | {ban_stat}\n"
+                write_safe(session_files["banned_accounts"], line)
+                write_safe(ufiles["banned_accounts"], line)
                 return
-            
+
             nick = player_data.get('nickname', 'N/A')
             if str(nick).lower() in ("unknown", "guest", ""):
                 return
-            
+
             skin = player_data.get('skin_count', 0)
             v2l = player_data.get('v2l_status', 'N/A')
             v2l_text = "ACTIVE" if str(v2l).lower() in ('enabled', 'yes', '1', 'true') else \
                        "INACTIVE" if str(v2l).lower() in ('disabled', 'no', '0', 'false') else "N/A"
             cur_rank = player_data.get('current_rank', 'Unranked')
             rank_category = get_rank_category(cur_rank)
-            
-            card_text = format_account_card(device, acc, zone, player_data)
-            
-            # Session copies
-            with open(session_files["all_hits_detail"], "a", encoding='utf-8') as f:
-                f.write(card_text + "\n")
-            with open(session_files["raw_devices_detail"], "a", encoding='utf-8') as f:
-                f.write(f"{device}\n")
+
+            card_text = format_account_card(device, acc, zone, player_data) + "\n"
+
+            # Session copies (uploaded at end)
+            write_safe(session_files["all_hits_detail"], card_text)
+            write_safe(session_files["raw_devices_detail"], f"{device}\n")
             if rank_category in session_files:
-                with open(session_files[rank_category], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
+                write_safe(session_files[rank_category], card_text)
             if v2l_text == "ACTIVE":
-                with open(session_files["v2l_active"], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
+                write_safe(session_files["v2l_active"], card_text)
             elif v2l_text == "INACTIVE":
-                with open(session_files["v2l_inactive"], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
+                write_safe(session_files["v2l_inactive"], card_text)
             if skin >= 200:
-                with open(session_files["sultan"], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
-            
-            # Persistent user-folder copies
-            with open(ufiles["all_hits_detail"], "a", encoding='utf-8') as f:
-                f.write(card_text + "\n")
-            with open(ufiles["raw_devices_detail"], "a", encoding='utf-8') as f:
-                f.write(f"{device}\n")
+                write_safe(session_files["sultan"], card_text)
+
+            # Persistent user copies
+            write_safe(ufiles["all_hits_detail"], card_text)
+            write_safe(ufiles["raw_devices_detail"], f"{device}\n")
             if rank_category in ufiles:
-                with open(ufiles[rank_category], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
+                write_safe(ufiles[rank_category], card_text)
             if v2l_text == "ACTIVE":
-                with open(ufiles["v2l_active"], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
+                write_safe(ufiles["v2l_active"], card_text)
             elif v2l_text == "INACTIVE":
-                with open(ufiles["v2l_inactive"], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
+                write_safe(ufiles["v2l_inactive"], card_text)
             if skin >= 200:
-                with open(ufiles["sultan"], "a", encoding='utf-8') as f:
-                    f.write(card_text + "\n")
-        
-        def update_stats(player_data):
+                write_safe(ufiles["sultan"], card_text)
+
+        def update_stats_from_player(player_data):
             if not player_data:
-                stats["no_info"] += 1
                 return
-            stats["info"] += 1
-            level = player_data.get('level', 0)
-            if isinstance(level, (int, float)):
-                if 1 <= level <= 30: stats["level_1_30"] += 1
-                elif 31 <= level <= 50: stats["level_31_50"] += 1
-                elif 51 <= level <= 99: stats["level_51_99"] += 1
-                elif level >= 100: stats["level_100_plus"] += 1
-            skin = player_data.get('skin_count', 0)
-            if isinstance(skin, (int, float)):
-                if 1 <= skin <= 50: stats["skin_1_50"] += 1
-                elif 51 <= skin <= 99: stats["skin_51_99"] += 1
-                elif 100 <= skin <= 250: stats["skin_100_250"] += 1
-                elif 251 <= skin <= 300: stats["skin_251_300"] += 1
-                elif 301 <= skin <= 400: stats["skin_301_400"] += 1
-                elif skin >= 401: stats["skin_400_plus"] += 1
-            rank_cat = get_rank_category(player_data.get('current_rank', 'Unranked'))
-            key = f"rank_{rank_cat}"
-            if key in stats:
-                stats[key] += 1
-        
-        def process_detail_session(device_id: str, account_id: int, zone_id: int) -> Optional[dict]:
+            with stats_lock:
+                stats["info"] += 1
+                level = player_data.get('level', 0)
+                if isinstance(level, (int, float)):
+                    if 1 <= level <= 30: stats["level_1_30"] += 1
+                    elif 31 <= level <= 50: stats["level_31_50"] += 1
+                    elif 51 <= level <= 99: stats["level_51_99"] += 1
+                    elif level >= 100: stats["level_100_plus"] += 1
+                skin = player_data.get('skin_count', 0)
+                if isinstance(skin, (int, float)):
+                    if 1 <= skin <= 50: stats["skin_1_50"] += 1
+                    elif 51 <= skin <= 99: stats["skin_51_99"] += 1
+                    elif 100 <= skin <= 250: stats["skin_100_250"] += 1
+                    elif 251 <= skin <= 300: stats["skin_251_300"] += 1
+                    elif 301 <= skin <= 400: stats["skin_301_400"] += 1
+                    elif skin >= 401: stats["skin_400_plus"] += 1
+                rank_cat = get_rank_category(player_data.get('current_rank', 'Unranked'))
+                key = f"rank_{rank_cat}"
+                if key in stats:
+                    stats[key] += 1
+
+        def process_one_device(device_id: str) -> str:
+            """
+            Single-device pipeline: login -> detail -> save.
+            Returns: "hit" | "banned" | "dead" | "detail_fail" | "no_info"
+            """
             try:
-                with GameConnection(device_id=device_id) as conn:
-                    if not conn.login_to_login_server():
-                        if 'ban' in conn.ban_status.lower():
-                            save_account_session(
-                                {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
-                                {'ban_status': conn.ban_status, 'nickname': 'BANNED'}
-                            )
-                        return None
-                    if not conn.get_game_server(): return None
-                    if not conn.connect_to_game_server(): return None
-                    
-                    skin_info = conn.get_skin_role_info(account_id, zone_id)
-                    ban_stat = conn.check_ban_status()
-                    
-                    if 'ban' in ban_stat.lower():
+                # ── Phase 1: quick login check ──
+                acc, zone, login_stat = GameLogin(device_id).run()
+                if not acc or not zone:
+                    stat_lower = str(login_stat).lower()
+                    if 'ban' in stat_lower:
                         save_account_session(
-                            {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
-                            {'ban_status': ban_stat, 'nickname': 'BANNED'}
+                            {'Device id': device_id, 'role_id': 0, 'zone_id': 0},
+                            {'ban_status': login_stat, 'nickname': 'BANNED'}
                         )
-                        return None
-                    
-                    v2l = get_v2l_status(conn, account_id, zone_id)
-                    result = conn.lookup_player(account_id)
-                    role_info = conn.get_role_info(account_id, zone_id)
-                    
-                    pd = {}
-                    if result and isinstance(result, dict):
-                        if isinstance(result.get(0), list) and len(result[0]) > 0:
-                            if isinstance(result[0][0], dict):
-                                pd = result[0][0]
-                            elif isinstance(result[0][0], SdpStruct):
-                                pd = dict(result[0][0])
-                        elif isinstance(result.get(0), dict):
-                            pd = result[0]
-                        elif isinstance(result.get(0), SdpStruct):
-                            pd = dict(result[0])
-                        else:
-                            pd = result
-                    
-                    if not isinstance(pd, dict):
-                        pd = {}
-                    
-                    skin_info = skin_info if isinstance(skin_info, dict) else {}
-                    role_info = role_info if isinstance(role_info, dict) else {}
-                    
-                    nick = pd.get(2) or skin_info.get(2) or role_info.get(2)
-                    
-                    if not nick or str(nick).lower() in ("unknown", "guest", ""):
-                        for key, value in pd.items():
-                            if isinstance(value, str) and len(value) > 1 and not value.isdigit():
-                                if value.lower() not in ("unknown", "guest", "null", "none"):
-                                    nick = value
-                                    break
-                    
-                    if not nick or str(nick).lower() in ("unknown", "guest", ""):
-                        if not pd and not skin_info and not role_info:
-                            return None
-                        nick = f"Player_{account_id}"
-                    
-                    level = pd.get(3) or skin_info.get(3) or role_info.get(3) or 1
-                    
-                    skin_cnt = 0
-                    if skin_info and skin_info.get(10) is not None:
-                        skin_cnt = skin_info.get(10)
-                    elif pd.get(83) is not None:
-                        skin_cnt = pd.get(83)
-                        
-                    hero_cnt = 0
-                    if skin_info and skin_info.get(9) is not None:
-                        hero_cnt = skin_info.get(9)
-                    elif role_info and role_info.get(9) is not None:
-                        hero_cnt = role_info.get(9)
-                    elif pd.get(9) is not None:
-                        hero_cnt = pd.get(9)
-                    
-                    cur_rank_val = pd.get(8) or skin_info.get(6, 0) or role_info.get(8, 0) or 0
-                    max_rank_val = pd.get(95) or skin_info.get(15, 0) or role_info.get(9, 0) or 0
-                    
-                    created_raw = pd.get(42) or conn.creation_ts
-                    created_at = ""
-                    if created_raw and isinstance(created_raw, (int, float)) and created_raw > 0:
-                        try:
-                            dt = datetime.fromtimestamp(created_raw, tz=timezone.utc).astimezone(TZ_WIB)
-                            created_at = dt.strftime("%Y-%m-%d %H:%M:%S WIB")
-                        except:
-                            pass
-                    
-                    player_data = {
-                        'nickname': nick, 
-                        'level': level, 
-                        'skin_count': skin_cnt,
-                        'hero_count': hero_cnt, 
-                        'current_rank': map_rank(cur_rank_val),
-                        'highest_rank': map_rank(max_rank_val) if max_rank_val else map_rank(cur_rank_val),
-                        'ban_status': ban_stat, 
-                        'v2l_status': v2l, 
-                        'created_at': created_at,
-                    }
-                    
-                    save_account_session(
-                        {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
-                        player_data
-                    )
-                    return player_data
-                    
-            except Exception:
-                return None
-        
+                        return "banned"
+                    write_safe(session_files["errors_log"],
+                               f"{device_id} | LOGIN FAIL | {login_stat}\n")
+                    return "dead"
+
+                # ── Phase 2: detail via fresh GameConnection ──
+                player_data = process_detail(device_id, acc, zone, user_id=user_id)
+                if not player_data:
+                    # Check if process_detail silently stored a banned entry
+                    # Or if the profile simply doesn't exist
+                    write_safe(session_files["errors_log"],
+                               f"{device_id} | acc={acc} zone={zone} | DETAIL FAIL\n")
+                    return "detail_fail"
+
+                # Mirror to session dir
+                save_account_session(
+                    {'Device id': device_id, 'role_id': acc, 'zone_id': zone},
+                    player_data
+                )
+                update_stats_from_player(player_data)
+                return "hit"
+
+            except Exception as e:
+                write_safe(session_files["errors_log"],
+                           f"{device_id} | EXCEPTION | {e}\n")
+                return "dead"
+
         def do_bulk():
-            hits = 0
+            from concurrent.futures import ThreadPoolExecutor, as_completed as ac
+
+            # Worker count: balance between speed & server rate limits.
+            # 30 is a safe value for MLBB login servers.
+            MAX_WORKERS = 30
+
             processed = 0
+            hits = 0
             failed = 0
-            
-            login_results = []
-            with ThreadPoolExecutor(max_workers=50) as ex:
-                futures = {ex.submit(GameLogin(dev).run): dev for dev in devices}
-                for future in as_completed(futures):
+            banned = 0
+            dead = 0
+            detail_fail = 0
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                futures = {ex.submit(process_one_device, dev): dev for dev in devices}
+                for future in ac(futures):
                     dev = futures[future]
                     try:
-                        acc, zone, stat = future.result(timeout=10)
-                        if acc and zone:
-                            login_results.append((dev, acc, zone))
-                        else:
-                            processed += 1
-                            stats["processed"] = processed
-                            if 'ban' in stat.lower():
-                                stats["banned"] += 1
-                            else:
-                                stats["unreg"] += 1
-                                stats["no_info"] += 1
-                                failed += 1
+                        outcome = future.result(timeout=60)
                     except Exception:
-                        processed += 1
-                        stats["processed"] = processed
-                        stats["failed"] += 1
-                        failed += 1
-                    
-                    if processed % 100 == 0:
-                        update_bulk_job(session_id, processed=processed, hits=hits, failed=failed)
-            
-            with ThreadPoolExecutor(max_workers=50) as ex:
-                futures = []
-                for dev, acc, zone in login_results:
-                    futures.append((dev, acc, zone, ex.submit(process_detail_session, dev, acc, zone)))
-                
-                for dev, acc, zone, future in futures:
-                    try:
-                        result = future.result(timeout=30)
-                        if result:
-                            hits += 1
-                            update_stats(result)
-                        else:
-                            stats["no_info"] += 1
-                            failed += 1
-                    except Exception:
-                        stats["no_info"] += 1
-                        failed += 1
+                        outcome = "dead"
+
                     processed += 1
-                    stats["processed"] = processed
-                    stats["hits"] = hits
-                    stats["failed"] = failed
-                    
-                    if processed % 100 == 0:
-                        update_bulk_job(session_id, processed=processed, hits=hits, failed=failed)
-            
+                    if outcome == "hit":
+                        hits += 1
+                    elif outcome == "banned":
+                        banned += 1
+                        failed += 1
+                    elif outcome == "detail_fail":
+                        detail_fail += 1
+                        failed += 1
+                    elif outcome == "dead":
+                        dead += 1
+                        failed += 1
+
+                    if processed % 10 == 0:
+                        with stats_lock:
+                            stats["processed"] = processed
+                            stats["hits"] = hits
+                            stats["failed"] = failed
+                            stats["banned"] = banned
+                            stats["dead"] = dead
+                            stats["detail_fail"] = detail_fail
+                        update_bulk_job(session_id, processed=processed,
+                                        hits=hits, failed=failed)
+
+            with stats_lock:
+                stats["processed"] = processed
+                stats["hits"] = hits
+                stats["failed"] = failed
+                stats["banned"] = banned
+                stats["dead"] = dead
+                stats["detail_fail"] = detail_fail
+
             update_bulk_job(
                 session_id,
                 processed=processed,
@@ -3719,23 +3653,23 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status="completed",
                 completed_at=datetime.now(TZ_WIB).isoformat()
             )
-        
+
         t = threading.Thread(target=do_bulk, daemon=True)
         t.start()
-        
+
         await status_msg.edit_text(
-            f"📊 <b>Loaded {stats['total']:,} IDs.</b>\n"
+            f"📊 <b>Loaded {stats['total']:,} unique IDs.</b>\n"
             f"🆔 Job ID: <code>{session_id}</code>\n"
-            f"⏳ Starting...\n\n"
+            f"⚙️ Workers: 30 | ⏳ Starting...\n\n"
             f"🔒 Results saved to YOUR folder.\n"
             f"💡 Use /status to check progress",
             parse_mode=ParseMode.HTML
         )
-        
+
         last_update = time.time()
         while t.is_alive():
             await asyncio.sleep(1)
-            if time.time() - last_update >= 3:
+            if time.time() - last_update >= 4:
                 job = get_bulk_job(session_id)
                 if job:
                     elapsed = time.time() - stats["start_time"]
@@ -3757,13 +3691,13 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
                 last_update = time.time()
-        
+
         elapsed = time.time() - stats["start_time"]
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
         speed = stats["processed"] / elapsed if elapsed > 0 else 0
         success_rate = (stats["hits"] / stats["processed"] * 100) if stats["processed"] > 0 else 0
-        
+
         final_text = (
             f"✅ <b>Bulk Check Complete!</b>\n"
             f"═══════════════════════════\n"
@@ -3771,6 +3705,9 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Total: {stats['processed']:,}\n"
             f"🎯 Valid: {stats['hits']:,}\n"
             f"❌ Failed: {stats['failed']:,}\n"
+            f"   ├ 🚫 Banned: {stats.get('banned',0):,}\n"
+            f"   ├ 💀 Dead/Invalid: {stats.get('dead',0):,}\n"
+            f"   └ ⚠️ Detail Fail: {stats.get('detail_fail',0):,}\n"
             f"📈 Success Rate: {success_rate:.2f}%\n"
             f"⏱️ Time: {minutes}m {seconds}s\n"
             f"⚡ Speed: {speed:.1f}/s\n\n"
@@ -3787,11 +3724,13 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Epic: {stats['rank_epic']} | Legend: {stats['rank_legend']}\n"
             f"Mythic+: {stats['rank_mythic']}"
         )
-        
+
         await status_msg.edit_text(final_text, parse_mode=ParseMode.HTML)
         await upload_bulk_results(update, context, stats, session_files, session_id)
-        
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         await status_msg.edit_text(f"❌ Error processing file: {str(e)}")
 
 
