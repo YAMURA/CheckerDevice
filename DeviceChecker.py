@@ -73,6 +73,7 @@ def ensure_dirs():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     for folder in FOLDERS.values():
         os.makedirs(os.path.join(OUTPUT_DIR, folder), exist_ok=True)
+    os.makedirs(os.path.join(OUTPUT_DIR, "user_sessions"), exist_ok=True)
 ensure_dirs()
 
 FILES = {
@@ -362,7 +363,6 @@ def get_user_bf_usage_stats(user_id: int) -> Tuple[int, int]:
     return len(devices), limit
 
 def refund_user_bf_device(user_id: int, device_id: str) -> bool:
-    """Remove a device from user's used list (refund the usage)."""
     with BF_LIMITS_LOCK:
         limits = load_json(BF_LIMITS_FILE)
         if "users" not in limits:
@@ -424,6 +424,54 @@ def cancel_bulk_job(session_id: str) -> bool:
             save_json(BULK_JOBS_FILE, jobs)
             return True
     return False
+
+# ────────────────────────────────────────────────────────────────
+# 2.7 PER-USER SESSION ISOLATION
+# ────────────────────────────────────────────────────────────────
+
+USER_SESSIONS_ROOT = os.path.join(OUTPUT_DIR, "user_sessions")
+os.makedirs(USER_SESSIONS_ROOT, exist_ok=True)
+
+def get_user_session_dir(user_id: int) -> str:
+    sdir = os.path.join(USER_SESSIONS_ROOT, str(user_id))
+    os.makedirs(sdir, exist_ok=True)
+    return sdir
+
+def get_user_files(user_id: int) -> dict:
+    sdir = get_user_session_dir(user_id)
+    return {
+        "all_hits_detail":     os.path.join(sdir, "all_hits_detail.txt"),
+        "raw_devices_detail":  os.path.join(sdir, "raw_devices_detail.txt"),
+        "banned_accounts":     os.path.join(sdir, "banned_accounts.txt"),
+        "v2l_active":          os.path.join(sdir, "v2l_active.txt"),
+        "v2l_inactive":        os.path.join(sdir, "v2l_inactive.txt"),
+        "sultan":              os.path.join(sdir, "sultan.txt"),
+        "warrior":             os.path.join(sdir, "warrior_hits.txt"),
+        "elite":               os.path.join(sdir, "elite_hits.txt"),
+        "master":              os.path.join(sdir, "master_hits.txt"),
+        "gm":                  os.path.join(sdir, "grandmaster_hits.txt"),
+        "epic":                os.path.join(sdir, "epic_hits.txt"),
+        "legend":              os.path.join(sdir, "legend_hits.txt"),
+        "mythic":              os.path.join(sdir, "mythic_hits.txt"),
+        "generated_devices":   os.path.join(sdir, "generated_devices.txt"),
+    }
+
+def get_user_rank_file(user_id: int, rank_category: str) -> Optional[str]:
+    return get_user_files(user_id).get(rank_category)
+
+USER_HIT_COUNTERS: Dict[int, Dict[str, int]] = {}
+USER_COUNTERS_LOCK = threading.Lock()
+
+def get_user_counters(user_id: int) -> dict:
+    with USER_COUNTERS_LOCK:
+        if user_id not in USER_HIT_COUNTERS:
+            USER_HIT_COUNTERS[user_id] = {
+                'sultan': 0, 'highrank': 0, 'v2l_active': 0, 'v2l_inactive': 0,
+                'akun_tua': 0, 'banned': 0,
+                'warrior': 0, 'elite': 0, 'master': 0, 'gm': 0,
+                'epic': 0, 'legend': 0, 'mythic': 0
+            }
+        return USER_HIT_COUNTERS[user_id]
 
 # ────────────────────────────────────────────────────────────────
 # 3. SDP PROTOCOL
@@ -893,10 +941,10 @@ def writer_thread(queue, output_file):
         if buffer:
             f.write(''.join(buffer))
 
-def run_generator(size_mb: float, threads: int = 16):
+def run_generator(size_mb: float, threads: int = 16, user_id: int = 0):
     generators = REALISTIC_GENERATORS
     target_lines = int((size_mb * 1024 * 1024) / AVG_BYTES_PER_LINE * 1.02)
-    output_file = FILES["generated_devices"]
+    output_file = get_user_files(user_id)["generated_devices"]
     if os.path.exists(output_file): os.remove(output_file)
     queue = Queue(maxsize=100000)
     writer = threading.Thread(target=writer_thread, args=(queue, output_file))
@@ -922,7 +970,7 @@ def run_generator(size_mb: float, threads: int = 16):
     return target_lines, output_file
 
 # ────────────────────────────────────────────────────────────────
-# 7. SAVE ENGINE
+# 7. SAVE ENGINE (per-user)
 # ────────────────────────────────────────────────────────────────
 
 HIT_COUNTERS = {
@@ -936,7 +984,8 @@ save_lock = threading.Lock()
 active_bf_sessions = {}
 bf_sessions_lock = threading.Lock()
 
-def get_rank_file(rank_category: str) -> str:
+def get_rank_file(rank_category: str) -> Optional[str]:
+    """Legacy: global rank file (admin view)."""
     rank_files = {
         "warrior": os.path.join(OUTPUT_DIR, FOLDERS["rank_warrior"], "warrior_hits.txt"),
         "elite": os.path.join(OUTPUT_DIR, FOLDERS["rank_elite"], "elite_hits.txt"),
@@ -972,84 +1021,92 @@ def format_account_card(device, acc, zone, player_data) -> str:
     ]
     return "\n".join(lines)
 
-def save_account(account_info: dict, player_data: dict, mode="detail"):
-    global HIT_COUNTERS
+def save_account(account_info: dict, player_data: dict, mode="detail", user_id: int = 0):
+    """Save account to per-user folder. Also mirror to admin/global legacy folder if user_id == 0."""
+    ufiles = get_user_files(user_id)
+    counters = get_user_counters(user_id)
+
     device = account_info.get('Device id', '')
     acc, zone = account_info.get('role_id', '?'), account_info.get('zone_id', '?')
     ban_stat = player_data.get('ban_status', 'NORMAL')
     is_banned = 'ban' in str(ban_stat).lower()
-    
+
     if is_banned:
-        banned_file = os.path.join(OUTPUT_DIR, FOLDERS["error"], "banned_accounts.txt")
         with save_lock:
-            with open(banned_file, "a", encoding='utf-8') as f:
+            with open(ufiles["banned_accounts"], "a", encoding='utf-8') as f:
                 f.write(f"{device} | {acc}:{zone} | {ban_stat}\n")
-        with COUNTER_LOCK:
-            HIT_COUNTERS['banned'] += 1
+        with USER_COUNTERS_LOCK:
+            counters['banned'] += 1
         return
-    
+
     nick = player_data.get('nickname', 'N/A')
     if str(nick).lower() in ("unknown", "guest", ""):
         return
-    
-    level = player_data.get('level', 'N/A')
-    skin = player_data.get('skin_count', 0)
-    hero = player_data.get('hero_count', 0)
+
     v2l = player_data.get('v2l_status', 'N/A')
     v2l_text = "ACTIVE" if str(v2l).lower() in ('enabled', 'yes', '1', 'true') else \
                "INACTIVE" if str(v2l).lower() in ('disabled', 'no', '0', 'false') else "N/A"
     cur_rank = player_data.get('current_rank', 'Unranked')
     rank_category = get_rank_category(cur_rank)
-    rank_folder = get_rank_file(rank_category)
+    skin = player_data.get('skin_count', 0)
     card_text = format_account_card(device, acc, zone, player_data)
-    
+
     with save_lock:
-        all_file = FILES["all_hits_detail"]
+        all_file = ufiles["all_hits_detail"]
         if not is_already_saved(device, all_file):
             with open(all_file, "a", encoding='utf-8') as f:
                 f.write(card_text + "\n")
-        raw_file = FILES["raw_devices_detail"]
+
+        raw_file = ufiles["raw_devices_detail"]
         if not is_already_saved(device, raw_file):
             with open(raw_file, "a", encoding='utf-8') as f:
                 f.write(f"{device}\n")
-        if rank_folder and not is_already_saved(device, rank_folder):
-            with open(rank_folder, "a", encoding='utf-8') as f:
+
+        rank_file = ufiles.get(rank_category)
+        if rank_file and not is_already_saved(device, rank_file):
+            with open(rank_file, "a", encoding='utf-8') as f:
                 f.write(card_text + "\n")
+
         if v2l_text == "ACTIVE":
-            v2l_file = os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt")
-            if not is_already_saved(device, v2l_file):
-                with open(v2l_file, "a", encoding='utf-8') as f:
+            vf = ufiles["v2l_active"]
+            if not is_already_saved(device, vf):
+                with open(vf, "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
-            with COUNTER_LOCK: HIT_COUNTERS['v2l_active'] += 1
+            with USER_COUNTERS_LOCK:
+                counters['v2l_active'] += 1
         elif v2l_text == "INACTIVE":
-            v2l_file = os.path.join(OUTPUT_DIR, FOLDERS["v2l_inactive"], "v2l_inactive.txt")
-            if not is_already_saved(device, v2l_file):
-                with open(v2l_file, "a", encoding='utf-8') as f:
+            vf = ufiles["v2l_inactive"]
+            if not is_already_saved(device, vf):
+                with open(vf, "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
-            with COUNTER_LOCK: HIT_COUNTERS['v2l_inactive'] += 1
+            with USER_COUNTERS_LOCK:
+                counters['v2l_inactive'] += 1
+
         if skin >= 200:
-            sultan_file = os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt")
-            if not is_already_saved(device, sultan_file):
-                with open(sultan_file, "a", encoding='utf-8') as f:
+            sf = ufiles["sultan"]
+            if not is_already_saved(device, sf):
+                with open(sf, "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
-            with COUNTER_LOCK: HIT_COUNTERS['sultan'] += 1
-    
-    with COUNTER_LOCK:
-        if rank_category in HIT_COUNTERS:
-            HIT_COUNTERS[rank_category] += 1
+            with USER_COUNTERS_LOCK:
+                counters['sultan'] += 1
+
+    with USER_COUNTERS_LOCK:
+        if rank_category in counters:
+            counters[rank_category] += 1
 
 # ────────────────────────────────────────────────────────────────
 # 8. DETAIL CHECK ENGINE
 # ────────────────────────────────────────────────────────────────
 
-def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[dict]:
+def process_detail(device_id: str, account_id: int, zone_id: int, user_id: int = 0) -> Optional[dict]:
     try:
         with GameConnection(device_id=device_id) as conn:
             if not conn.login_to_login_server():
                 if 'ban' in conn.ban_status.lower():
                     save_account(
                         {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
-                        {'ban_status': conn.ban_status, 'nickname': 'BANNED'}, "detail"
+                        {'ban_status': conn.ban_status, 'nickname': 'BANNED'}, "detail",
+                        user_id=user_id
                     )
                 return None
             if not conn.get_game_server(): return None
@@ -1061,7 +1118,8 @@ def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[di
             if 'ban' in ban_stat.lower():
                 save_account(
                     {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
-                    {'ban_status': ban_stat, 'nickname': 'BANNED'}, "detail"
+                    {'ban_status': ban_stat, 'nickname': 'BANNED'}, "detail",
+                    user_id=user_id
                 )
                 return None
                 
@@ -1145,11 +1203,11 @@ def process_detail(device_id: str, account_id: int, zone_id: int) -> Optional[di
             
             save_account(
                 {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
-                player_data, "detail"
+                player_data, "detail", user_id=user_id
             )
             return player_data
             
-    except Exception as e:
+    except Exception:
         return None
 
 # ────────────────────────────────────────────────────────────────
@@ -1261,7 +1319,6 @@ def escape_html(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Advanced main menu with better organization"""
     kb = [
         [InlineKeyboardButton("🔨 Generate", callback_data="gen_menu"),
          InlineKeyboardButton("🔍 Single Check", callback_data="single_menu"),
@@ -1285,8 +1342,8 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
         [InlineKeyboardButton("➕ Add User", callback_data="admin_adduser"),
          InlineKeyboardButton("📊 Bot Stats", callback_data="admin_botstats")],
-        [InlineKeyboardButton("📁 My Files", callback_data="files"),
-         InlineKeyboardButton("⚡ BF Limits", callback_data="admin_bf_limits")],
+        [InlineKeyboardButton("⚡ BF Limits", callback_data="admin_bf_limits"),
+         InlineKeyboardButton("🌐 Legacy Files", callback_data="admin_legacy_files")],
         [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(kb)
@@ -1308,7 +1365,6 @@ def back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
 
 def confirm_keyboard(action: str, data: str = "") -> InlineKeyboardMarkup:
-    """Confirmation dialog keyboard"""
     kb = [
         [InlineKeyboardButton("✅ Yes", callback_data=f"confirm_{action}_{data}"),
          InlineKeyboardButton("❌ No", callback_data="main_menu")]
@@ -1379,7 +1435,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """About the bot"""
     text = (
         "ℹ️ <b>ABOUT THIS BOT</b>\n"
         "═══════════════════════════\n"
@@ -1395,7 +1450,7 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• V2L status detection\n"
         "• Brute force / session kicker\n"
         "• Bulk job status tracking\n"
-        "• Session-based file outputs\n\n"
+        "• Per-user isolated file storage\n\n"
         "👨‍💻 <b>Developer:</b> @ZyronDevv\n"
         "📅 <b>Version:</b> 2.0\n"
         "═══════════════════════════\n"
@@ -1404,10 +1459,8 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check bulk job status"""
     user_id = update.effective_user.id
     
-    # Check if user specified a job ID
     if context.args:
         job_id = context.args[0].strip()
         job = get_bulk_job(job_id)
@@ -1424,7 +1477,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_job_status(update, context, job)
         return
     
-    # Show all active jobs for this user
     active_jobs = get_user_active_jobs(user_id)
     
     if not active_jobs:
@@ -1463,7 +1515,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def show_job_status(update: Update, context: ContextTypes.DEFAULT_TYPE, job: dict):
-    """Show detailed job status"""
     elapsed = time.time() - datetime.fromisoformat(job['started_at']).timestamp()
     speed = job['processed'] / elapsed if elapsed > 0 else 0
     progress = (job['processed'] / job['total'] * 100) if job['total'] > 0 else 0
@@ -1493,12 +1544,10 @@ async def show_job_status(update: Update, context: ContextTypes.DEFAULT_TYPE, jo
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 async def cmd_bfstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop a running brute force"""
     user_id = update.effective_user.id
     device_id = context.user_data.get('bf_device', '')
     
     if not device_id:
-        # Check for any active sessions
         active = []
         with bf_sessions_lock:
             for key, session in active_bf_sessions.items():
@@ -1512,7 +1561,6 @@ async def cmd_bfstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Stop all active sessions for this user
         for key in active:
             with bf_sessions_lock:
                 if key in active_bf_sessions:
@@ -1551,7 +1599,6 @@ async def cmd_bfstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
 
 async def cmd_bfstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current brute force status"""
     user_id = update.effective_user.id
     
     active_sessions = []
@@ -1597,10 +1644,8 @@ async def cmd_bfstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 async def cmd_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to check a single device ID"""
     if context.args:
         device_id = context.args[0].strip()
-        # Process directly
         await process_single_device(update, context, device_id)
     else:
         context.user_data["waiting_for_single_check"] = True
@@ -1616,7 +1661,6 @@ async def cmd_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to start bulk check"""
     context.user_data["waiting_for_bulk"] = True
     await update.message.reply_text(
         f"📂 <b>BULK CHECK (MAX {MAX_BULK_DEVICES:,})</b>\n"
@@ -1635,11 +1679,9 @@ async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_bruteforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to start brute force"""
     if context.args:
         device_id = context.args[0].strip()
         context.user_data["waiting_for_bruteforce"] = True
-        # Simulate device input
         await process_bf_device(update, context, device_id)
     else:
         context.user_data["waiting_for_bruteforce"] = True
@@ -1721,9 +1763,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 Single Check - Check one device\n"
         "📂 Bulk Check - Upload .txt file (max 100K)\n"
         "⚡ Brute Force - Spam login kicker\n"
-        "📊 Statistics - View hit counters\n"
-        "📁 My Files - Download result files\n"
+        "📊 Statistics - View your hit counters\n"
+        "📁 My Files - Download YOUR result files only\n"
         "👤 My Profile - View your access info\n\n"
+        "🔒 <b>Note:</b> Each user has their own isolated\n"
+        "file storage — you only see your own results.\n\n"
         "═══════════════════════════\n"
         "✨ Created by: @ZyronDevv"
     )
@@ -1804,7 +1848,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
     
-    # Handle job status callbacks (no auth needed for own jobs)
     if data.startswith("jobstatus_"):
         job_id = data.replace("jobstatus_", "")
         job = get_bulk_job(job_id)
@@ -1850,7 +1893,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if data == "status_menu":
-        # Show status menu
         active_jobs = get_user_active_jobs(user_id)
         if not active_jobs:
             await query.edit_message_text(
@@ -1984,7 +2026,8 @@ async def show_gen_menu(query, context):
         "Select the size of device IDs to generate:\n\n"
         "💡 <b>1 MB ≈ 13,000 devices</b>\n"
         "💡 <b>10 MB ≈ 130,000 devices</b>\n"
-        "💡 <b>50 MB ≈ 650,000 devices</b>"
+        "💡 <b>50 MB ≈ 650,000 devices</b>\n\n"
+        "🔒 Files are stored in YOUR personal folder."
     )
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -2051,90 +2094,163 @@ async def show_bf_menu(query, context):
 # ────────────────────────────────────────────────────────────────
 
 async def show_stats(query, context):
-    with COUNTER_LOCK:
-        lines = ["📊 <b>STATISTICS</b>", "═══════════════════════════", "<b>Rank Distribution:</b>"]
-        rank_emojis = {'warrior': '🥉', 'elite': '🥈', 'master': '🥇', 'gm': '⭐', 'epic': '💜', 'legend': '💠', 'mythic': '🔥'}
-        for rank in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
-            count = HIT_COUNTERS.get(rank, 0)
-            emoji = rank_emojis.get(rank, '•')
-            lines.append(f"  {emoji} {rank.capitalize():<12}: {count:,}")
-        
-        lines.append(f"\n<b>V2L Status:</b>")
-        lines.append(f"  🟢 Active: {HIT_COUNTERS.get('v2l_active', 0):,}")
-        lines.append(f"  🔴 Inactive: {HIT_COUNTERS.get('v2l_inactive', 0):,}")
-        lines.append(f"\n<b>Special:</b>")
-        lines.append(f"  👑 Sultan: {HIT_COUNTERS.get('sultan', 0):,}")
-        lines.append(f"  🚫 Banned: {HIT_COUNTERS.get('banned', 0):,}")
-        
-        total = sum(HIT_COUNTERS.get(r, 0) for r in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic'])
-        if total > 0:
-            lines.append(f"\n✅ <b>Total Good Accounts:</b> {total:,}")
-        lines.append("═══════════════════════════")
-    
+    """Per-user statistics."""
+    user_id = query.from_user.id
+    counters = get_user_counters(user_id)
+
+    lines = [
+        "📊 <b>YOUR STATISTICS</b>",
+        "═══════════════════════════",
+        "<b>Your Rank Hits:</b>"
+    ]
+    rank_emojis = {'warrior': '🥉', 'elite': '🥈', 'master': '🥇', 'gm': '⭐',
+                   'epic': '💜', 'legend': '💠', 'mythic': '🔥'}
+    for rank in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
+        count = counters.get(rank, 0)
+        emoji = rank_emojis.get(rank, '•')
+        lines.append(f"  {emoji} {rank.capitalize():<12}: {count:,}")
+
+    lines.append(f"\n<b>Your V2L Status:</b>")
+    lines.append(f"  🟢 Active: {counters.get('v2l_active', 0):,}")
+    lines.append(f"  🔴 Inactive: {counters.get('v2l_inactive', 0):,}")
+    lines.append(f"\n<b>Special:</b>")
+    lines.append(f"  👑 Sultan: {counters.get('sultan', 0):,}")
+    lines.append(f"  🚫 Banned: {counters.get('banned', 0):,}")
+
+    total = sum(counters.get(r, 0) for r in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic'])
+    if total > 0:
+        lines.append(f"\n✅ <b>Your Total Good Accounts:</b> {total:,}")
+    lines.append("═══════════════════════════")
+
     await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
 
 async def show_files(query, context):
+    """Show ONLY files belonging to the calling user."""
+    user_id = query.from_user.id
+    ufiles = get_user_files(user_id)
     file_buttons = []
-    for name, path in FILES.items():
+
+    display_names = {
+        "all_hits_detail": "all_hits_detail",
+        "raw_devices_detail": "raw_devices_detail",
+        "banned_accounts": "banned_accounts",
+        "v2l_active": "v2l_active",
+        "v2l_inactive": "v2l_inactive",
+        "sultan": "sultan",
+        "warrior": "warrior_hits",
+        "elite": "elite_hits",
+        "master": "master_hits",
+        "gm": "grandmaster_hits",
+        "epic": "epic_hits",
+        "legend": "legend_hits",
+        "mythic": "mythic_hits",
+        "generated_devices": "generated_devices",
+    }
+
+    for key, path in ufiles.items():
         if os.path.exists(path) and os.path.getsize(path) > 0:
             size = os.path.getsize(path)
             size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
-            file_buttons.append([InlineKeyboardButton(f"📄 {name} ({size_str})", callback_data=f"download_{name}")])
-    
-    for rank_name in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
-        rank_file = get_rank_file(rank_name)
-        if rank_file and os.path.exists(rank_file) and os.path.getsize(rank_file) > 0:
-            size = os.path.getsize(rank_file)
-            size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
-            file_buttons.append([InlineKeyboardButton(f"🏆 {rank_name}_hits ({size_str})", callback_data=f"download_rank_{rank_name}")])
-    
-    for v2l_type in ['v2l_active', 'v2l_inactive']:
-        v2l_file = os.path.join(OUTPUT_DIR, FOLDERS[v2l_type], f"{v2l_type}.txt")
-        if os.path.exists(v2l_file) and os.path.getsize(v2l_file) > 0:
-            size = os.path.getsize(v2l_file)
-            size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
-            file_buttons.append([InlineKeyboardButton(f"🔐 {v2l_type} ({size_str})", callback_data=f"download_{v2l_type}")])
-    
-    sultan_file = os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt")
-    if os.path.exists(sultan_file) and os.path.getsize(sultan_file) > 0:
-        size = os.path.getsize(sultan_file)
-        size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
-        file_buttons.append([InlineKeyboardButton(f"👑 sultan ({size_str})", callback_data=f"download_sultan")])
-    
+            label = display_names.get(key, key)
+            file_buttons.append([
+                InlineKeyboardButton(f"📄 {label} ({size_str})",
+                                     callback_data=f"download_user_{key}")
+            ])
+
     file_buttons.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-    
+
     if len(file_buttons) <= 1:
-        text = "📁 <b>My Files</b>\n═══════════════════════════\n\nNo files available yet.\nGenerate or check devices first!"
+        text = (
+            "📁 <b>My Files</b>\n"
+            "═══════════════════════════\n\n"
+            "No files available yet.\n"
+            "Run a check or generate devices first!\n\n"
+            f"🆔 Your folder: <code>user_sessions/{user_id}/</code>\n"
+            "🔒 Only you can see these files."
+        )
     else:
-        text = "📁 <b>My Files</b>\n═══════════════════════════\n\nSelect a file to download:"
-    
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(file_buttons))
+        text = (
+            "📁 <b>My Files</b>\n"
+            "═══════════════════════════\n\n"
+            "🔒 These are <b>your personal files only</b>.\n"
+            "Other users cannot see them.\n\n"
+            "Select a file to download:"
+        )
+
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                  reply_markup=InlineKeyboardMarkup(file_buttons))
 
 async def handle_download(query, data, context):
-    file_key = data.replace("download_", "")
-    
-    if file_key.startswith("rank_"):
-        rank_name = file_key.replace("rank_", "")
-        file_path = get_rank_file(rank_name)
-    else:
-        file_path = FILES.get(file_key)
+    """Download handler that resolves per-user paths."""
+    user_id = query.from_user.id
+
+    # Admin legacy: download_legacy_<filekey>
+    if data.startswith("download_legacy_"):
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only!", show_alert=True)
+            return
+        key = data.replace("download_legacy_", "")
+        file_path = FILES.get(key)
         if not file_path:
             special = {
                 "v2l_active": os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt"),
                 "v2l_inactive": os.path.join(OUTPUT_DIR, FOLDERS["v2l_inactive"], "v2l_inactive.txt"),
                 "sultan": os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt"),
             }
-            file_path = special.get(file_key)
-    
+            file_path = special.get(key)
+        if not file_path or not os.path.exists(file_path):
+            await query.answer("❌ File not found!", show_alert=True)
+            return
+        with open(file_path, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=InputFile(f, filename=os.path.basename(file_path)),
+                caption=f"🌐 LEGACY: {os.path.basename(file_path)}"
+            )
+        await query.answer("✅ File sent!")
+        return
+
+    # Admin legacy rank download
+    if data.startswith("download_legacyrank_"):
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only!", show_alert=True)
+            return
+        rank_name = data.replace("download_legacyrank_", "")
+        file_path = get_rank_file(rank_name)
+        if not file_path or not os.path.exists(file_path):
+            await query.answer("❌ File not found!", show_alert=True)
+            return
+        with open(file_path, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=InputFile(f, filename=os.path.basename(file_path)),
+                caption=f"🌐 LEGACY: {os.path.basename(file_path)}"
+            )
+        await query.answer("✅ File sent!")
+        return
+
+    # Per-user download
+    ufiles = get_user_files(user_id)
+
+    if data.startswith("download_user_"):
+        key = data.replace("download_user_", "")
+        file_path = ufiles.get(key)
+    elif data.startswith("download_rank_"):
+        rank_name = data.replace("download_rank_", "")
+        file_path = ufiles.get(rank_name)
+    else:
+        key = data.replace("download_", "")
+        file_path = ufiles.get(key)
+
     if not file_path or not os.path.exists(file_path):
         await query.answer("❌ File not found!", show_alert=True)
         return
-    
+
     with open(file_path, 'rb') as f:
         await context.bot.send_document(
             chat_id=query.message.chat_id,
             document=InputFile(f, filename=os.path.basename(file_path)),
-            caption=f"📄 {os.path.basename(file_path)}"
+            caption=f"📄 {os.path.basename(file_path)} (your file)"
         )
     await query.answer("✅ File sent!")
 
@@ -2203,8 +2319,11 @@ async def show_help(query, context):
         "🔍 <b>Single Check</b> - Check one device\n"
         "📂 <b>Bulk Check</b> - Upload .txt file (max 100K)\n"
         "⚡ <b>Brute Force</b> - Spam login kicker\n"
-        "📊 <b>Statistics</b> - View hit counters\n"
+        "📊 <b>Statistics</b> - View YOUR hit counters\n"
+        "📁 <b>My Files</b> - Download YOUR result files only\n"
         "👤 <b>My Profile</b> - View your access info\n\n"
+        "🔒 <b>Isolation:</b> Each user gets their own\n"
+        "private folder. You cannot see other users' results.\n\n"
         "═══════════════════════════\n"
         "✨ Created by: @ZyronDevv"
     )
@@ -2217,15 +2336,17 @@ async def show_help(query, context):
 async def handle_gen_callback(query, data, context):
     if data.startswith("gen_start_"):
         size = float(data.split("_")[-1])
+        user_id = query.from_user.id
         await query.edit_message_text(
             f"⏳ <b>Generating {size} MB of device IDs...</b>\n"
-            f"Using 16 threads. Please wait...",
+            f"Using 16 threads. Please wait...\n"
+            f"🔒 Saving to YOUR folder only.",
             parse_mode=ParseMode.HTML
         )
         
         result = [None]
         def worker():
-            result[0] = run_generator(size, 16)
+            result[0] = run_generator(size, 16, user_id=user_id)
         
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -2237,7 +2358,7 @@ async def handle_gen_callback(query, data, context):
         file_size = os.path.getsize(output_file) / (1024*1024)
         
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📥 Download File", callback_data="download_generated_devices")],
+            [InlineKeyboardButton("📥 Download File", callback_data="download_user_generated_devices")],
             [InlineKeyboardButton("🔙 Back", callback_data="gen_menu")]
         ])
         await query.edit_message_text(
@@ -2245,7 +2366,8 @@ async def handle_gen_callback(query, data, context):
             f"═══════════════════════════\n"
             f"📦 Size: {file_size:.2f} MB\n"
             f"📊 Devices: {target_lines:,}\n"
-            f"📁 File: generated_devices.txt",
+            f"📁 File: generated_devices.txt\n"
+            f"🔒 Stored in your private folder",
             parse_mode=ParseMode.HTML, reply_markup=kb
         )
 
@@ -2765,6 +2887,66 @@ async def handle_admin_callback(query, data, context):
         
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=bf_limits_admin_keyboard())
 
+    elif data == "admin_legacy_files":
+        # Show legacy/global files only admins can see
+        file_buttons = []
+        legacy_map = {
+            "all_hits_detail": FILES["all_hits_detail"],
+            "raw_devices_detail": FILES["raw_devices_detail"],
+            "login_valid": FILES["login_valid"],
+            "generated_devices": FILES["generated_devices"],
+        }
+        for key, path in legacy_map.items():
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                size = os.path.getsize(path)
+                size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+                file_buttons.append([InlineKeyboardButton(
+                    f"🌐 {key} ({size_str})",
+                    callback_data=f"download_legacy_{key}"
+                )])
+        for rank_name in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
+            rf = get_rank_file(rank_name)
+            if rf and os.path.exists(rf) and os.path.getsize(rf) > 0:
+                size = os.path.getsize(rf)
+                size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+                file_buttons.append([InlineKeyboardButton(
+                    f"🌐 {rank_name}_hits ({size_str})",
+                    callback_data=f"download_legacyrank_{rank_name}"
+                )])
+        # Legacy special folders
+        for key, fname in [("v2l_active", "v2l_active.txt"), ("v2l_inactive", "v2l_inactive.txt")]:
+            p = os.path.join(OUTPUT_DIR, FOLDERS[key], fname)
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                size = os.path.getsize(p)
+                size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+                file_buttons.append([InlineKeyboardButton(
+                    f"🌐 {key} ({size_str})",
+                    callback_data=f"download_legacy_{key}"
+                )])
+        p = os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt")
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            size = os.path.getsize(p)
+            size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+            file_buttons.append([InlineKeyboardButton(
+                f"🌐 sultan ({size_str})",
+                callback_data=f"download_legacy_sultan"
+            )])
+
+        file_buttons.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")])
+
+        if len(file_buttons) <= 1:
+            text = "🌐 <b>Legacy Global Files</b>\n═══════════════════════════\n\nNo legacy files available."
+        else:
+            text = (
+                "🌐 <b>Legacy Global Files (Admin Only)</b>\n"
+                "═══════════════════════════\n\n"
+                "These are the OLD global files. New files go to\n"
+                "per-user folders and are not visible to other users.\n\n"
+                "Select a file to download:"
+            )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                      reply_markup=InlineKeyboardMarkup(file_buttons))
+
 # ────────────────────────────────────────────────────────────────
 # 20. ADMIN BF TEXT HANDLER
 # ────────────────────────────────────────────────────────────────
@@ -2885,7 +3067,6 @@ async def _conversation_router(update: Update, context: ContextTypes.DEFAULT_TYP
 # ────────────────────────────────────────────────────────────────
 
 async def handle_all_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unified text input handler that routes based on state."""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
@@ -2925,7 +3106,7 @@ async def handle_all_text_input(update: Update, context: ContextTypes.DEFAULT_TY
 # ────────────────────────────────────────────────────────────────
 
 async def process_single_device(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
-    """Process a single device ID check"""
+    user_id = update.effective_user.id
     await update.message.reply_text("⏳ Checking account... Please wait.", reply_markup=ReplyKeyboardRemove())
     
     result = [None, None]
@@ -2935,7 +3116,7 @@ async def process_single_device(update: Update, context: ContextTypes.DEFAULT_TY
             result[0] = None
             result[1] = stat
             return
-        player_data = process_detail(device_id, acc, zone)
+        player_data = process_detail(device_id, acc, zone, user_id=user_id)
         result[0] = (acc, zone)
         result[1] = player_data
     
@@ -3016,7 +3197,6 @@ async def handle_single_check_input(update: Update, context: ContextTypes.DEFAUL
 # ────────────────────────────────────────────────────────────────
 
 async def process_bf_device(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
-    """Process a device for brute force"""
     user_id = update.effective_user.id
     
     user_devices = get_user_bf_devices(user_id)
@@ -3195,7 +3375,6 @@ async def handle_bf_custom_delay(update: Update, context: ContextTypes.DEFAULT_T
 # ────────────────────────────────────────────────────────────────
 
 async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bulk check .txt file upload with session-specific output files."""
     if not update.message or not update.message.document:
         return
     
@@ -3206,7 +3385,6 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = update.effective_user.id
     
-    # Check for existing active jobs
     active_jobs = get_user_active_jobs(user_id)
     if active_jobs and not is_admin(user_id):
         await update.message.reply_text(
@@ -3242,10 +3420,12 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Create job record
         create_bulk_job(user_id, len(devices), session_id)
         
-        # Session-specific file paths
+        # Per-user persistent files (visible in "My Files")
+        ufiles = get_user_files(user_id)
+        
+        # Job session files (uploaded at end)
         session_files = {
             "all_hits_detail": os.path.join(session_dir, "all_hits_detail.txt"),
             "raw_devices_detail": os.path.join(session_dir, "raw_devices_detail.txt"),
@@ -3278,6 +3458,7 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         
         def save_account_session(account_info: dict, player_data: dict):
+            """Write to both session folder (for upload) AND user folder (for My Files)."""
             device = account_info.get('Device id', '')
             acc, zone = account_info.get('role_id', '?'), account_info.get('zone_id', '?')
             ban_stat = player_data.get('ban_status', 'NORMAL')
@@ -3285,6 +3466,8 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if is_banned:
                 with open(session_files["banned_accounts"], "a", encoding='utf-8') as f:
+                    f.write(f"{device} | {acc}:{zone} | {ban_stat}\n")
+                with open(ufiles["banned_accounts"], "a", encoding='utf-8') as f:
                     f.write(f"{device} | {acc}:{zone} | {ban_stat}\n")
                 return
             
@@ -3301,27 +3484,65 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             card_text = format_account_card(device, acc, zone, player_data)
             
+            # Session copies
             with open(session_files["all_hits_detail"], "a", encoding='utf-8') as f:
                 f.write(card_text + "\n")
-            
             with open(session_files["raw_devices_detail"], "a", encoding='utf-8') as f:
                 f.write(f"{device}\n")
-            
-            rank_key = rank_category if rank_category in session_files else None
-            if rank_key and rank_key in session_files:
-                with open(session_files[rank_key], "a", encoding='utf-8') as f:
+            if rank_category in session_files:
+                with open(session_files[rank_category], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
-            
             if v2l_text == "ACTIVE":
                 with open(session_files["v2l_active"], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
             elif v2l_text == "INACTIVE":
                 with open(session_files["v2l_inactive"], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
-            
             if skin >= 200:
                 with open(session_files["sultan"], "a", encoding='utf-8') as f:
                     f.write(card_text + "\n")
+            
+            # Persistent user-folder copies
+            with open(ufiles["all_hits_detail"], "a", encoding='utf-8') as f:
+                f.write(card_text + "\n")
+            with open(ufiles["raw_devices_detail"], "a", encoding='utf-8') as f:
+                f.write(f"{device}\n")
+            if rank_category in ufiles:
+                with open(ufiles[rank_category], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            if v2l_text == "ACTIVE":
+                with open(ufiles["v2l_active"], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            elif v2l_text == "INACTIVE":
+                with open(ufiles["v2l_inactive"], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            if skin >= 200:
+                with open(ufiles["sultan"], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+        
+        def update_stats(player_data):
+            if not player_data:
+                stats["no_info"] += 1
+                return
+            stats["info"] += 1
+            level = player_data.get('level', 0)
+            if isinstance(level, (int, float)):
+                if 1 <= level <= 30: stats["level_1_30"] += 1
+                elif 31 <= level <= 50: stats["level_31_50"] += 1
+                elif 51 <= level <= 99: stats["level_51_99"] += 1
+                elif level >= 100: stats["level_100_plus"] += 1
+            skin = player_data.get('skin_count', 0)
+            if isinstance(skin, (int, float)):
+                if 1 <= skin <= 50: stats["skin_1_50"] += 1
+                elif 51 <= skin <= 99: stats["skin_51_99"] += 1
+                elif 100 <= skin <= 250: stats["skin_100_250"] += 1
+                elif 251 <= skin <= 300: stats["skin_251_300"] += 1
+                elif 301 <= skin <= 400: stats["skin_301_400"] += 1
+                elif skin >= 401: stats["skin_400_plus"] += 1
+            rank_cat = get_rank_category(player_data.get('current_rank', 'Unranked'))
+            key = f"rank_{rank_cat}"
+            if key in stats:
+                stats[key] += 1
         
         def process_detail_session(device_id: str, account_id: int, zone_id: int) -> Optional[dict]:
             try:
@@ -3433,30 +3654,6 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 return None
         
-        def update_stats(player_data):
-            if not player_data:
-                stats["no_info"] += 1
-                return
-            stats["info"] += 1
-            level = player_data.get('level', 0)
-            if isinstance(level, (int, float)):
-                if 1 <= level <= 30: stats["level_1_30"] += 1
-                elif 31 <= level <= 50: stats["level_31_50"] += 1
-                elif 51 <= level <= 99: stats["level_51_99"] += 1
-                elif level >= 100: stats["level_100_plus"] += 1
-            skin = player_data.get('skin_count', 0)
-            if isinstance(skin, (int, float)):
-                if 1 <= skin <= 50: stats["skin_1_50"] += 1
-                elif 51 <= skin <= 99: stats["skin_51_99"] += 1
-                elif 100 <= skin <= 250: stats["skin_100_250"] += 1
-                elif 251 <= skin <= 300: stats["skin_251_300"] += 1
-                elif 301 <= skin <= 400: stats["skin_301_400"] += 1
-                elif skin >= 401: stats["skin_400_plus"] += 1
-            rank_cat = get_rank_category(player_data.get('current_rank', 'Unranked'))
-            key = f"rank_{rank_cat}"
-            if key in stats:
-                stats[key] += 1
-
         def do_bulk():
             hits = 0
             processed = 0
@@ -3530,6 +3727,7 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 <b>Loaded {stats['total']:,} IDs.</b>\n"
             f"🆔 Job ID: <code>{session_id}</code>\n"
             f"⏳ Starting...\n\n"
+            f"🔒 Results saved to YOUR folder.\n"
             f"💡 Use /status to check progress",
             parse_mode=ParseMode.HTML
         )
@@ -3598,7 +3796,6 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE, stats: dict, session_files: dict, session_id: str):
-    """Upload session-specific result files."""
     upload_msg = await update.message.reply_text(
         f"📤 <b>Uploading result files for job {session_id}...</b>",
         parse_mode=ParseMode.HTML
@@ -3809,6 +4006,7 @@ def main():
     print("👑 Created by: @ZyronDevv")
     print("=" * 60)
     print(f"📁 Output Dir: {OUTPUT_DIR}")
+    print(f"👤 Per-user sessions: {USER_SESSIONS_ROOT}")
     print(f"🔑 Keys File: {KEYS_FILE}")
     print(f"👥 Users File: {USERS_FILE}")
     print(f"⚡ BF Limits File: {BF_LIMITS_FILE}")
@@ -3828,7 +4026,6 @@ def main():
     
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # ─── COMMANDS ───
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("about", cmd_about))
@@ -3842,13 +4039,9 @@ def main():
     app.add_handler(CommandHandler("bfstop", cmd_bfstop))
     app.add_handler(CommandHandler("bfstatus", cmd_bfstatus))
     
-    # ─── CALLBACKS ───
     app.add_handler(CallbackQueryHandler(callback_handler))
-    
-    # ─── DOCUMENT HANDLER (must come before conversation handler) ───
     app.add_handler(MessageHandler(filters.Document.ALL, handle_bulk_file))
     
-    # ─── CONVERSATION HANDLER ───
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.TEXT & ~filters.COMMAND, _conversation_router),
@@ -3881,7 +4074,6 @@ def main():
     )
     app.add_handler(conv_handler)
     
-    # ─── UNIFIED TEXT HANDLER ───
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_input))
     
     print("✅ Bot is running! Press Ctrl+C to stop.")
