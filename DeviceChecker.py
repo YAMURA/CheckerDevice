@@ -2778,12 +2778,34 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ No device IDs found in file!")
             return
         
-        # Limit to prevent abuse (optional)
         if len(devices) > 5000:
             await status_msg.edit_text(f"❌ Too many devices! Max 5000 per file. Found: {len(devices)}")
             return
         
-        stats = {
+        # ─── CLEAR RESULT FILES FOR THIS BULK CHECK ───
+        # This ensures results only contain devices from THIS file
+        result_files_to_clear = [
+            FILES["all_hits_detail"],
+            FILES["raw_devices_detail"],
+            os.path.join(OUTPUT_DIR, FOLDERS["error"], "banned_accounts.txt"),
+            os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt"),
+            os.path.join(OUTPUT_DIR, FOLDERS["v2l_inactive"], "v2l_inactive.txt"),
+            os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt"),
+        ]
+        # Add rank files
+        for rank_name in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
+            rf = get_rank_file(rank_name)
+            if rf:
+                result_files_to_clear.append(rf)
+        
+        for fp in result_files_to_clear:
+            if os.path.exists(fp):
+                os.remove(fp)
+        
+        # ─── RESET RELEVANT COUNTERS FOR THIS BULK CHECK ───
+        # We don't reset global counters (they show lifetime stats),
+        # but we track separate counters for this bulk session
+        bulk_stats = {
             "total": len(devices), "processed": 0, "hits": 0, "info": 0,
             "no_info": 0, "unreg": 0, "banned": 0, "failed": 0,
             "level_1_30": 0, "level_31_50": 0, "level_51_99": 0, "level_100_plus": 0,
@@ -2794,29 +2816,29 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "start_time": time.time()
         }
         
-        def update_stats(player_data):
+        def update_bulk_stats(player_data):
             if not player_data:
-                stats["no_info"] += 1
+                bulk_stats["no_info"] += 1
                 return
-            stats["info"] += 1
+            bulk_stats["info"] += 1
             level = player_data.get('level', 0)
             if isinstance(level, (int, float)):
-                if 1 <= level <= 30: stats["level_1_30"] += 1
-                elif 31 <= level <= 50: stats["level_31_50"] += 1
-                elif 51 <= level <= 99: stats["level_51_99"] += 1
-                elif level >= 100: stats["level_100_plus"] += 1
+                if 1 <= level <= 30: bulk_stats["level_1_30"] += 1
+                elif 31 <= level <= 50: bulk_stats["level_31_50"] += 1
+                elif 51 <= level <= 99: bulk_stats["level_51_99"] += 1
+                elif level >= 100: bulk_stats["level_100_plus"] += 1
             skin = player_data.get('skin_count', 0)
             if isinstance(skin, (int, float)):
-                if 1 <= skin <= 50: stats["skin_1_50"] += 1
-                elif 51 <= skin <= 99: stats["skin_51_99"] += 1
-                elif 100 <= skin <= 250: stats["skin_100_250"] += 1
-                elif 251 <= skin <= 300: stats["skin_251_300"] += 1
-                elif 301 <= skin <= 400: stats["skin_301_400"] += 1
-                elif skin >= 401: stats["skin_400_plus"] += 1
+                if 1 <= skin <= 50: bulk_stats["skin_1_50"] += 1
+                elif 51 <= skin <= 99: bulk_stats["skin_51_99"] += 1
+                elif 100 <= skin <= 250: bulk_stats["skin_100_250"] += 1
+                elif 251 <= skin <= 300: bulk_stats["skin_251_300"] += 1
+                elif 301 <= skin <= 400: bulk_stats["skin_301_400"] += 1
+                elif skin >= 401: bulk_stats["skin_400_plus"] += 1
             rank_cat = get_rank_category(player_data.get('current_rank', 'Unranked'))
             key = f"rank_{rank_cat}"
-            if key in stats:
-                stats[key] += 1
+            if key in bulk_stats:
+                bulk_stats[key] += 1
 
         def do_bulk():
             hits = 0
@@ -2835,17 +2857,17 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             login_results.append((dev, acc, zone))
                         else:
                             processed += 1
-                            stats["processed"] = processed
+                            bulk_stats["processed"] = processed
                             if 'ban' in stat.lower():
-                                stats["banned"] += 1
+                                bulk_stats["banned"] += 1
                             else:
-                                stats["unreg"] += 1
-                                stats["no_info"] += 1
+                                bulk_stats["unreg"] += 1
+                                bulk_stats["no_info"] += 1
                                 failed += 1
                     except Exception:
                         processed += 1
-                        stats["processed"] = processed
-                        stats["failed"] += 1
+                        bulk_stats["processed"] = processed
+                        bulk_stats["failed"] += 1
                         failed += 1
             
             # Then process details in parallel
@@ -2859,23 +2881,23 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         result = future.result(timeout=30)
                         if result:
                             hits += 1
-                            update_stats(result)
+                            update_bulk_stats(result)
                         else:
-                            stats["no_info"] += 1
+                            bulk_stats["no_info"] += 1
                             failed += 1
                     except Exception:
-                        stats["no_info"] += 1
+                        bulk_stats["no_info"] += 1
                         failed += 1
                     processed += 1
-                    stats["processed"] = processed
-                    stats["hits"] = hits
-                    stats["failed"] = failed
+                    bulk_stats["processed"] = processed
+                    bulk_stats["hits"] = hits
+                    bulk_stats["failed"] = failed
         
         t = threading.Thread(target=do_bulk, daemon=True)
         t.start()
         
         await status_msg.edit_text(
-            f"📊 <b>Loaded {stats['total']} IDs.</b>\n"
+            f"📊 <b>Loaded {bulk_stats['total']} IDs.</b>\n"
             f"⏳ Starting...",
             parse_mode=ParseMode.HTML
         )
@@ -2884,15 +2906,15 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         while t.is_alive():
             await asyncio.sleep(1)
             if time.time() - last_update >= 3:
-                elapsed = time.time() - stats["start_time"]
-                speed = stats["processed"] / elapsed if elapsed > 0 else 0
-                eta = (stats["total"] - stats["processed"]) / speed if speed > 0 else 0
+                elapsed = time.time() - bulk_stats["start_time"]
+                speed = bulk_stats["processed"] / elapsed if elapsed > 0 else 0
+                eta = (bulk_stats["total"] - bulk_stats["processed"]) / speed if speed > 0 else 0
                 try:
                     await status_msg.edit_text(
                         f"📊 <b>Task Running...</b>\n"
-                        f"Total checked: {stats['processed']}/{stats['total']}\n"
-                        f"Valid found: {stats['hits']}\n"
-                        f"Failed: {stats['failed']}\n"
+                        f"Total checked: {bulk_stats['processed']}/{bulk_stats['total']}\n"
+                        f"Valid found: {bulk_stats['hits']}\n"
+                        f"Failed: {bulk_stats['failed']}\n"
                         f"Speed: {speed:.1f}/s\n"
                         f"ETA: {eta/60:.1f}m",
                         parse_mode=ParseMode.HTML
@@ -2901,36 +2923,36 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
                 last_update = time.time()
         
-        elapsed = time.time() - stats["start_time"]
+        elapsed = time.time() - bulk_stats["start_time"]
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
-        speed = stats["processed"] / elapsed if elapsed > 0 else 0
-        success_rate = (stats["hits"] / stats["processed"] * 100) if stats["processed"] > 0 else 0
+        speed = bulk_stats["processed"] / elapsed if elapsed > 0 else 0
+        success_rate = (bulk_stats["hits"] / bulk_stats["processed"] * 100) if bulk_stats["processed"] > 0 else 0
         
         final_text = (
             f"✅ <b>Task Complete!</b>\n\n"
-            f"Total checked: {stats['processed']}\n"
-            f"Valid found: {stats['hits']}\n"
-            f"Failed: {stats['failed']}\n"
+            f"Total checked: {bulk_stats['processed']}\n"
+            f"Valid found: {bulk_stats['hits']}\n"
+            f"Failed: {bulk_stats['failed']}\n"
             f"Success rate: {success_rate:.2f}%\n"
             f"Total time: {minutes}m {seconds}s\n"
             f"Avg speed: {speed:.1f}/s\n\n"
             f"📈 <b>Level</b>\n"
-            f"1-30: {stats['level_1_30']} | 31-50: {stats['level_31_50']}\n"
-            f"51-99: {stats['level_51_99']} | 100+: {stats['level_100_plus']}\n\n"
+            f"1-30: {bulk_stats['level_1_30']} | 31-50: {bulk_stats['level_31_50']}\n"
+            f"51-99: {bulk_stats['level_51_99']} | 100+: {bulk_stats['level_100_plus']}\n\n"
             f"🎨 <b>Skin</b>\n"
-            f"1-50: {stats['skin_1_50']} | 51-99: {stats['skin_51_99']}\n"
-            f"100-250: {stats['skin_100_250']} | 251-300: {stats['skin_251_300']}\n"
-            f"301-400: {stats['skin_301_400']} | 401+: {stats['skin_400_plus']}\n\n"
+            f"1-50: {bulk_stats['skin_1_50']} | 51-99: {bulk_stats['skin_51_99']}\n"
+            f"100-250: {bulk_stats['skin_100_250']} | 251-300: {bulk_stats['skin_251_300']}\n"
+            f"301-400: {bulk_stats['skin_301_400']} | 401+: {bulk_stats['skin_400_plus']}\n\n"
             f"🏆 <b>Rank</b>\n"
-            f"Warrior: {stats['rank_warrior']} | Elite: {stats['rank_elite']}\n"
-            f"Master: {stats['rank_master']} | GM: {stats['rank_gm']}\n"
-            f"Epic: {stats['rank_epic']} | Legend: {stats['rank_legend']}\n"
-            f"Mythic+: {stats['rank_mythic']}"
+            f"Warrior: {bulk_stats['rank_warrior']} | Elite: {bulk_stats['rank_elite']}\n"
+            f"Master: {bulk_stats['rank_master']} | GM: {bulk_stats['rank_gm']}\n"
+            f"Epic: {bulk_stats['rank_epic']} | Legend: {bulk_stats['rank_legend']}\n"
+            f"Mythic+: {bulk_stats['rank_mythic']}"
         )
         
         await status_msg.edit_text(final_text, parse_mode=ParseMode.HTML)
-        await upload_bulk_results(update, context, stats)
+        await upload_bulk_results(update, context, bulk_stats)
         
     except Exception as e:
         await status_msg.edit_text(f"❌ Error processing file: {str(e)}")
