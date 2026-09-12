@@ -2755,7 +2755,7 @@ async def handle_bf_custom_delay(update: Update, context: ContextTypes.DEFAULT_T
 # ────────────────────────────────────────────────────────────────
 
 async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bulk check .txt file upload."""
+    """Handle bulk check .txt file upload with session-specific output files."""
     if not update.message or not update.message.document:
         return
     
@@ -2778,34 +2778,39 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ No device IDs found in file!")
             return
         
+        # Limit to prevent abuse
         if len(devices) > 5000:
             await status_msg.edit_text(f"❌ Too many devices! Max 5000 per file. Found: {len(devices)}")
             return
         
-        # ─── CLEAR RESULT FILES FOR THIS BULK CHECK ───
-        # This ensures results only contain devices from THIS file
-        result_files_to_clear = [
-            FILES["all_hits_detail"],
-            FILES["raw_devices_detail"],
-            os.path.join(OUTPUT_DIR, FOLDERS["error"], "banned_accounts.txt"),
-            os.path.join(OUTPUT_DIR, FOLDERS["v2l_active"], "v2l_active.txt"),
-            os.path.join(OUTPUT_DIR, FOLDERS["v2l_inactive"], "v2l_inactive.txt"),
-            os.path.join(OUTPUT_DIR, FOLDERS["sultan"], "sultan.txt"),
-        ]
-        # Add rank files
-        for rank_name in ['warrior', 'elite', 'master', 'gm', 'epic', 'legend', 'mythic']:
-            rf = get_rank_file(rank_name)
-            if rf:
-                result_files_to_clear.append(rf)
+        # ─── CREATE SESSION-SPECIFIC OUTPUT DIRECTORY ───
+        session_id = f"bulk_{int(time.time())}"
+        session_dir = os.path.join(OUTPUT_DIR, "bulk_sessions", session_id)
+        os.makedirs(session_dir, exist_ok=True)
         
-        for fp in result_files_to_clear:
-            if os.path.exists(fp):
-                os.remove(fp)
+        # Session-specific file paths
+        session_files = {
+            "all_hits_detail": os.path.join(session_dir, "all_hits_detail.txt"),
+            "raw_devices_detail": os.path.join(session_dir, "raw_devices_detail.txt"),
+            "banned_accounts": os.path.join(session_dir, "banned_accounts.txt"),
+            "v2l_active": os.path.join(session_dir, "v2l_active.txt"),
+            "v2l_inactive": os.path.join(session_dir, "v2l_inactive.txt"),
+            "sultan": os.path.join(session_dir, "sultan.txt"),
+            "warrior": os.path.join(session_dir, "warrior_hits.txt"),
+            "elite": os.path.join(session_dir, "elite_hits.txt"),
+            "master": os.path.join(session_dir, "master_hits.txt"),
+            "gm": os.path.join(session_dir, "grandmaster_hits.txt"),
+            "epic": os.path.join(session_dir, "epic_hits.txt"),
+            "legend": os.path.join(session_dir, "legend_hits.txt"),
+            "mythic": os.path.join(session_dir, "mythic_hits.txt"),
+        }
         
-        # ─── RESET RELEVANT COUNTERS FOR THIS BULK CHECK ───
-        # We don't reset global counters (they show lifetime stats),
-        # but we track separate counters for this bulk session
-        bulk_stats = {
+        # Initialize empty session files
+        for fpath in session_files.values():
+            with open(fpath, 'w', encoding='utf-8') as f:
+                pass  # Create empty file
+        
+        stats = {
             "total": len(devices), "processed": 0, "hits": 0, "info": 0,
             "no_info": 0, "unreg": 0, "banned": 0, "failed": 0,
             "level_1_30": 0, "level_31_50": 0, "level_51_99": 0, "level_100_plus": 0,
@@ -2816,36 +2821,201 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "start_time": time.time()
         }
         
-        def update_bulk_stats(player_data):
-            if not player_data:
-                bulk_stats["no_info"] += 1
+        # ─── SESSION-SPECIFIC SAVE FUNCTION ───
+        def save_account_session(account_info: dict, player_data: dict):
+            """Save account to session-specific files only."""
+            device = account_info.get('Device id', '')
+            acc, zone = account_info.get('role_id', '?'), account_info.get('zone_id', '?')
+            ban_stat = player_data.get('ban_status', 'NORMAL')
+            is_banned = 'ban' in str(ban_stat).lower()
+            
+            if is_banned:
+                with open(session_files["banned_accounts"], "a", encoding='utf-8') as f:
+                    f.write(f"{device} | {acc}:{zone} | {ban_stat}\n")
                 return
-            bulk_stats["info"] += 1
+            
+            nick = player_data.get('nickname', 'N/A')
+            if str(nick).lower() in ("unknown", "guest", ""):
+                return
+            
+            skin = player_data.get('skin_count', 0)
+            v2l = player_data.get('v2l_status', 'N/A')
+            v2l_text = "ACTIVE" if str(v2l).lower() in ('enabled', 'yes', '1', 'true') else \
+                       "INACTIVE" if str(v2l).lower() in ('disabled', 'no', '0', 'false') else "N/A"
+            cur_rank = player_data.get('current_rank', 'Unranked')
+            rank_category = get_rank_category(cur_rank)
+            
+            card_text = format_account_card(device, acc, zone, player_data)
+            
+            # Write to session-specific files
+            with open(session_files["all_hits_detail"], "a", encoding='utf-8') as f:
+                f.write(card_text + "\n")
+            
+            with open(session_files["raw_devices_detail"], "a", encoding='utf-8') as f:
+                f.write(f"{device}\n")
+            
+            # Rank file
+            rank_key = rank_category if rank_category in session_files else None
+            if rank_key and rank_key in session_files:
+                with open(session_files[rank_key], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            
+            # V2L files
+            if v2l_text == "ACTIVE":
+                with open(session_files["v2l_active"], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            elif v2l_text == "INACTIVE":
+                with open(session_files["v2l_inactive"], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+            
+            # Sultan file
+            if skin >= 200:
+                with open(session_files["sultan"], "a", encoding='utf-8') as f:
+                    f.write(card_text + "\n")
+        
+        # ─── SESSION-SPECIFIC DETAIL PROCESSOR ───
+        def process_detail_session(device_id: str, account_id: int, zone_id: int) -> Optional[dict]:
+            """Process detail and save to session files."""
+            try:
+                with GameConnection(device_id=device_id) as conn:
+                    if not conn.login_to_login_server():
+                        if 'ban' in conn.ban_status.lower():
+                            save_account_session(
+                                {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
+                                {'ban_status': conn.ban_status, 'nickname': 'BANNED'}
+                            )
+                        return None
+                    if not conn.get_game_server(): return None
+                    if not conn.connect_to_game_server(): return None
+                    
+                    skin_info = conn.get_skin_role_info(account_id, zone_id)
+                    ban_stat = conn.check_ban_status()
+                    
+                    if 'ban' in ban_stat.lower():
+                        save_account_session(
+                            {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
+                            {'ban_status': ban_stat, 'nickname': 'BANNED'}
+                        )
+                        return None
+                    
+                    v2l = get_v2l_status(conn, account_id, zone_id)
+                    result = conn.lookup_player(account_id)
+                    role_info = conn.get_role_info(account_id, zone_id)
+                    
+                    # Robust player data extraction
+                    pd = {}
+                    if result and isinstance(result, dict):
+                        if isinstance(result.get(0), list) and len(result[0]) > 0:
+                            if isinstance(result[0][0], dict):
+                                pd = result[0][0]
+                            elif isinstance(result[0][0], SdpStruct):
+                                pd = dict(result[0][0])
+                        elif isinstance(result.get(0), dict):
+                            pd = result[0]
+                        elif isinstance(result.get(0), SdpStruct):
+                            pd = dict(result[0])
+                        else:
+                            pd = result
+                    
+                    if not isinstance(pd, dict):
+                        pd = {}
+                    
+                    skin_info = skin_info if isinstance(skin_info, dict) else {}
+                    role_info = role_info if isinstance(role_info, dict) else {}
+                    
+                    nick = pd.get(2) or skin_info.get(2) or role_info.get(2)
+                    
+                    if not nick or str(nick).lower() in ("unknown", "guest", ""):
+                        for key, value in pd.items():
+                            if isinstance(value, str) and len(value) > 1 and not value.isdigit():
+                                if value.lower() not in ("unknown", "guest", "null", "none"):
+                                    nick = value
+                                    break
+                    
+                    if not nick or str(nick).lower() in ("unknown", "guest", ""):
+                        if not pd and not skin_info and not role_info:
+                            return None
+                        nick = f"Player_{account_id}"
+                    
+                    level = pd.get(3) or skin_info.get(3) or role_info.get(3) or 1
+                    
+                    skin_cnt = 0
+                    if skin_info and skin_info.get(10) is not None:
+                        skin_cnt = skin_info.get(10)
+                    elif pd.get(83) is not None:
+                        skin_cnt = pd.get(83)
+                        
+                    hero_cnt = 0
+                    if skin_info and skin_info.get(9) is not None:
+                        hero_cnt = skin_info.get(9)
+                    elif role_info and role_info.get(9) is not None:
+                        hero_cnt = role_info.get(9)
+                    elif pd.get(9) is not None:
+                        hero_cnt = pd.get(9)
+                    
+                    cur_rank_val = pd.get(8) or skin_info.get(6, 0) or role_info.get(8, 0) or 0
+                    max_rank_val = pd.get(95) or skin_info.get(15, 0) or role_info.get(9, 0) or 0
+                    
+                    created_raw = pd.get(42) or conn.creation_ts
+                    created_at = ""
+                    if created_raw and isinstance(created_raw, (int, float)) and created_raw > 0:
+                        try:
+                            dt = datetime.fromtimestamp(created_raw, tz=timezone.utc).astimezone(TZ_WIB)
+                            created_at = dt.strftime("%Y-%m-%d %H:%M:%S WIB")
+                        except:
+                            pass
+                    
+                    player_data = {
+                        'nickname': nick, 
+                        'level': level, 
+                        'skin_count': skin_cnt,
+                        'hero_count': hero_cnt, 
+                        'current_rank': map_rank(cur_rank_val),
+                        'highest_rank': map_rank(max_rank_val) if max_rank_val else map_rank(cur_rank_val),
+                        'ban_status': ban_stat, 
+                        'v2l_status': v2l, 
+                        'created_at': created_at,
+                    }
+                    
+                    save_account_session(
+                        {'Device id': device_id, 'role_id': account_id, 'zone_id': zone_id},
+                        player_data
+                    )
+                    return player_data
+                    
+            except Exception:
+                return None
+        
+        def update_stats(player_data):
+            if not player_data:
+                stats["no_info"] += 1
+                return
+            stats["info"] += 1
             level = player_data.get('level', 0)
             if isinstance(level, (int, float)):
-                if 1 <= level <= 30: bulk_stats["level_1_30"] += 1
-                elif 31 <= level <= 50: bulk_stats["level_31_50"] += 1
-                elif 51 <= level <= 99: bulk_stats["level_51_99"] += 1
-                elif level >= 100: bulk_stats["level_100_plus"] += 1
+                if 1 <= level <= 30: stats["level_1_30"] += 1
+                elif 31 <= level <= 50: stats["level_31_50"] += 1
+                elif 51 <= level <= 99: stats["level_51_99"] += 1
+                elif level >= 100: stats["level_100_plus"] += 1
             skin = player_data.get('skin_count', 0)
             if isinstance(skin, (int, float)):
-                if 1 <= skin <= 50: bulk_stats["skin_1_50"] += 1
-                elif 51 <= skin <= 99: bulk_stats["skin_51_99"] += 1
-                elif 100 <= skin <= 250: bulk_stats["skin_100_250"] += 1
-                elif 251 <= skin <= 300: bulk_stats["skin_251_300"] += 1
-                elif 301 <= skin <= 400: bulk_stats["skin_301_400"] += 1
-                elif skin >= 401: bulk_stats["skin_400_plus"] += 1
+                if 1 <= skin <= 50: stats["skin_1_50"] += 1
+                elif 51 <= skin <= 99: stats["skin_51_99"] += 1
+                elif 100 <= skin <= 250: stats["skin_100_250"] += 1
+                elif 251 <= skin <= 300: stats["skin_251_300"] += 1
+                elif 301 <= skin <= 400: stats["skin_301_400"] += 1
+                elif skin >= 401: stats["skin_400_plus"] += 1
             rank_cat = get_rank_category(player_data.get('current_rank', 'Unranked'))
             key = f"rank_{rank_cat}"
-            if key in bulk_stats:
-                bulk_stats[key] += 1
+            if key in stats:
+                stats[key] += 1
 
         def do_bulk():
             hits = 0
             processed = 0
             failed = 0
             
-            # First, do login checks in parallel
+            # Login checks in parallel
             login_results = []
             with ThreadPoolExecutor(max_workers=50) as ex:
                 futures = {ex.submit(GameLogin(dev).run): dev for dev in devices}
@@ -2857,47 +3027,47 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             login_results.append((dev, acc, zone))
                         else:
                             processed += 1
-                            bulk_stats["processed"] = processed
+                            stats["processed"] = processed
                             if 'ban' in stat.lower():
-                                bulk_stats["banned"] += 1
+                                stats["banned"] += 1
                             else:
-                                bulk_stats["unreg"] += 1
-                                bulk_stats["no_info"] += 1
+                                stats["unreg"] += 1
+                                stats["no_info"] += 1
                                 failed += 1
                     except Exception:
                         processed += 1
-                        bulk_stats["processed"] = processed
-                        bulk_stats["failed"] += 1
+                        stats["processed"] = processed
+                        stats["failed"] += 1
                         failed += 1
             
-            # Then process details in parallel
+            # Detail checks in parallel (using session-specific processor)
             with ThreadPoolExecutor(max_workers=50) as ex:
                 futures = []
                 for dev, acc, zone in login_results:
-                    futures.append((dev, acc, zone, ex.submit(process_detail, dev, acc, zone)))
+                    futures.append((dev, acc, zone, ex.submit(process_detail_session, dev, acc, zone)))
                 
                 for dev, acc, zone, future in futures:
                     try:
                         result = future.result(timeout=30)
                         if result:
                             hits += 1
-                            update_bulk_stats(result)
+                            update_stats(result)
                         else:
-                            bulk_stats["no_info"] += 1
+                            stats["no_info"] += 1
                             failed += 1
                     except Exception:
-                        bulk_stats["no_info"] += 1
+                        stats["no_info"] += 1
                         failed += 1
                     processed += 1
-                    bulk_stats["processed"] = processed
-                    bulk_stats["hits"] = hits
-                    bulk_stats["failed"] = failed
+                    stats["processed"] = processed
+                    stats["hits"] = hits
+                    stats["failed"] = failed
         
         t = threading.Thread(target=do_bulk, daemon=True)
         t.start()
         
         await status_msg.edit_text(
-            f"📊 <b>Loaded {bulk_stats['total']} IDs.</b>\n"
+            f"📊 <b>Loaded {stats['total']} IDs.</b>\n"
             f"⏳ Starting...",
             parse_mode=ParseMode.HTML
         )
@@ -2906,15 +3076,15 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         while t.is_alive():
             await asyncio.sleep(1)
             if time.time() - last_update >= 3:
-                elapsed = time.time() - bulk_stats["start_time"]
-                speed = bulk_stats["processed"] / elapsed if elapsed > 0 else 0
-                eta = (bulk_stats["total"] - bulk_stats["processed"]) / speed if speed > 0 else 0
+                elapsed = time.time() - stats["start_time"]
+                speed = stats["processed"] / elapsed if elapsed > 0 else 0
+                eta = (stats["total"] - stats["processed"]) / speed if speed > 0 else 0
                 try:
                     await status_msg.edit_text(
                         f"📊 <b>Task Running...</b>\n"
-                        f"Total checked: {bulk_stats['processed']}/{bulk_stats['total']}\n"
-                        f"Valid found: {bulk_stats['hits']}\n"
-                        f"Failed: {bulk_stats['failed']}\n"
+                        f"Total checked: {stats['processed']}/{stats['total']}\n"
+                        f"Valid found: {stats['hits']}\n"
+                        f"Failed: {stats['failed']}\n"
                         f"Speed: {speed:.1f}/s\n"
                         f"ETA: {eta/60:.1f}m",
                         parse_mode=ParseMode.HTML
@@ -2923,55 +3093,70 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
                 last_update = time.time()
         
-        elapsed = time.time() - bulk_stats["start_time"]
+        elapsed = time.time() - stats["start_time"]
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
-        speed = bulk_stats["processed"] / elapsed if elapsed > 0 else 0
-        success_rate = (bulk_stats["hits"] / bulk_stats["processed"] * 100) if bulk_stats["processed"] > 0 else 0
+        speed = stats["processed"] / elapsed if elapsed > 0 else 0
+        success_rate = (stats["hits"] / stats["processed"] * 100) if stats["processed"] > 0 else 0
         
         final_text = (
             f"✅ <b>Task Complete!</b>\n\n"
-            f"Total checked: {bulk_stats['processed']}\n"
-            f"Valid found: {bulk_stats['hits']}\n"
-            f"Failed: {bulk_stats['failed']}\n"
+            f"Total checked: {stats['processed']}\n"
+            f"Valid found: {stats['hits']}\n"
+            f"Failed: {stats['failed']}\n"
             f"Success rate: {success_rate:.2f}%\n"
             f"Total time: {minutes}m {seconds}s\n"
             f"Avg speed: {speed:.1f}/s\n\n"
             f"📈 <b>Level</b>\n"
-            f"1-30: {bulk_stats['level_1_30']} | 31-50: {bulk_stats['level_31_50']}\n"
-            f"51-99: {bulk_stats['level_51_99']} | 100+: {bulk_stats['level_100_plus']}\n\n"
+            f"1-30: {stats['level_1_30']} | 31-50: {stats['level_31_50']}\n"
+            f"51-99: {stats['level_51_99']} | 100+: {stats['level_100_plus']}\n\n"
             f"🎨 <b>Skin</b>\n"
-            f"1-50: {bulk_stats['skin_1_50']} | 51-99: {bulk_stats['skin_51_99']}\n"
-            f"100-250: {bulk_stats['skin_100_250']} | 251-300: {bulk_stats['skin_251_300']}\n"
-            f"301-400: {bulk_stats['skin_301_400']} | 401+: {bulk_stats['skin_400_plus']}\n\n"
+            f"1-50: {stats['skin_1_50']} | 51-99: {stats['skin_51_99']}\n"
+            f"100-250: {stats['skin_100_250']} | 251-300: {stats['skin_251_300']}\n"
+            f"301-400: {stats['skin_301_400']} | 401+: {stats['skin_400_plus']}\n\n"
             f"🏆 <b>Rank</b>\n"
-            f"Warrior: {bulk_stats['rank_warrior']} | Elite: {bulk_stats['rank_elite']}\n"
-            f"Master: {bulk_stats['rank_master']} | GM: {bulk_stats['rank_gm']}\n"
-            f"Epic: {bulk_stats['rank_epic']} | Legend: {bulk_stats['rank_legend']}\n"
-            f"Mythic+: {bulk_stats['rank_mythic']}"
+            f"Warrior: {stats['rank_warrior']} | Elite: {stats['rank_elite']}\n"
+            f"Master: {stats['rank_master']} | GM: {stats['rank_gm']}\n"
+            f"Epic: {stats['rank_epic']} | Legend: {stats['rank_legend']}\n"
+            f"Mythic+: {stats['rank_mythic']}"
         )
         
         await status_msg.edit_text(final_text, parse_mode=ParseMode.HTML)
-        await upload_bulk_results(update, context, bulk_stats)
+        await upload_bulk_results(update, context, stats, session_files)
         
     except Exception as e:
         await status_msg.edit_text(f"❌ Error processing file: {str(e)}")
 
-async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE, stats: dict):
+
+async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE, stats: dict, session_files: dict):
+    """Upload session-specific result files."""
     upload_msg = await update.message.reply_text("📤 <b>Uploading result files...</b>", parse_mode=ParseMode.HTML)
     
     files_uploaded = []
     files_failed = []
     files_to_upload = []
     
-    if os.path.exists(FILES["all_hits_detail"]) and os.path.getsize(FILES["all_hits_detail"]) > 0:
-        files_to_upload.append((FILES["all_hits_detail"], "all_hits_detail.txt"))
-    if os.path.exists(FILES["raw_devices_detail"]) and os.path.getsize(FILES["raw_devices_detail"]) > 0:
-        files_to_upload.append((FILES["raw_devices_detail"], "raw_devices_detail.txt"))
+    # Map session files to display names
+    file_map = {
+        "all_hits_detail": "all_hits_detail.txt",
+        "raw_devices_detail": "raw_devices_detail.txt",
+        "banned_accounts": "banned_accounts.txt",
+        "v2l_active": "v2l_active.txt",
+        "v2l_inactive": "v2l_inactive.txt",
+        "sultan": "sultan.txt",
+        "warrior": "warrior_hits.txt",
+        "elite": "elite_hits.txt",
+        "master": "master_hits.txt",
+        "gm": "grandmaster_hits.txt",
+        "epic": "epic_hits.txt",
+        "legend": "legend_hits.txt",
+        "mythic": "mythic_hits.txt",
+    }
     
-    banned_file = os.path.join(OUTPUT_DIR, FOLDERS["error"], "banned_accounts.txt")
-    if os.path.exists(banned_file) and os.path.getsize(banned_file) > 0:
-        files_to_upload.append((banned_file, "banned_accounts.txt"))
+    for key, display_name in file_map.items():
+        fpath = session_files.get(key)
+        if fpath and os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+            files_to_upload.append((fpath, display_name))
     
     if not files_to_upload:
         await upload_msg.edit_text("✅ No result files to upload.", parse_mode=ParseMode.HTML)
@@ -2996,7 +3181,9 @@ async def upload_bulk_results(update: Update, context: ContextTypes.DEFAULT_TYPE
     summary += f"📊 Total: {stats['processed']}\n"
     summary += f"🎯 Valid: {stats['hits']}\n"
     if files_uploaded:
-        summary += f"\n📄 Uploaded: {', '.join(files_uploaded)}"
+        summary += f"\n📄 Uploaded files ({len(files_uploaded)}):\n"
+        for fname in files_uploaded:
+            summary += f"  • {fname}\n"
     if files_failed:
         summary += f"\n❌ Failed: {', '.join(files_failed)}"
     
