@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# ===================================================================
-# PREMIUM DEVID SEKER - TELEGRAM BOT SYSTEM v5.0
-# Created by: @ZyronDevv
-# Features: Key Access + Inline Buttons + Generator + Bulk Check
-#          + Single Check + Brute Force + Admin Panel
-# ===================================================================
-
 import os, sys, time, random, uuid, json, threading, socket, zlib, asyncio
 import struct, re, requests, shutil, glob
 from queue import Queue
@@ -2793,14 +2785,6 @@ async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "all_hits_detail": os.path.join(session_dir, "all_hits_detail.txt"),
             "raw_devices_detail": os.path.join(session_dir, "raw_devices_detail.txt"),
             "banned_accounts": os.path.join(session_dir, "banned_accounts.txt"),
-            "v2l_active": os.path.join(session_dir, "v2l_active.txt"),
-            "v2l_inactive": os.path.join(session_dir, "v2l_inactive.txt"),
-            "sultan": os.path.join(session_dir, "sultan.txt"),
-            "warrior": os.path.join(session_dir, "warrior_hits.txt"),
-            "elite": os.path.join(session_dir, "elite_hits.txt"),
-            "master": os.path.join(session_dir, "master_hits.txt"),
-            "gm": os.path.join(session_dir, "grandmaster_hits.txt"),
-            "epic": os.path.join(session_dir, "epic_hits.txt"),
             "legend": os.path.join(session_dir, "legend_hits.txt"),
             "mythic": os.path.join(session_dir, "mythic_hits.txt"),
         }
