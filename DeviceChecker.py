@@ -948,7 +948,7 @@ class KeyManager:
             logger.error(f"Save users error: {e}")
 
     def generate_key(self, duration_seconds: int, label: str, created_by: int) -> str:
-        key = "ATX-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+        key = "ZYRON-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
         self.keys[key] = {
             "duration": duration_seconds, "label": label,
             "created_by": created_by, "created_at": time.time(),
