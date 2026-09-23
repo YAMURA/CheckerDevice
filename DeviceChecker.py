@@ -3925,6 +3925,13 @@ async def post_init(application: Application) -> None:
     MAIN_LOOP = asyncio.get_running_loop()
     logger.info(f"Main event loop captured: {MAIN_LOOP}")
 
+    # === FIX: remove any active webhook so polling can work ===
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted (drop_pending_updates=True). Polling can now start.")
+    except Exception as e:
+        logger.error(f"Failed to delete webhook: {e}")
+
 
 def main():
     bot = MLBBBot()
@@ -3956,7 +3963,10 @@ def main():
     print(f"Single check max retries: {MAX_SINGLE_CHECK_RETRIES}x (early-return on definitive answer)")
     print(f"Ban check max retries: {MAX_BAN_CHECK_RETRIES}x (early-return on definitive answer)")
     print("Press Ctrl+C to stop.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == '__main__':
