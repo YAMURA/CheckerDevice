@@ -21,6 +21,7 @@ import importlib.util
 import subprocess
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 
 def _ensure_requirements() -> None:
@@ -61,6 +62,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Silence noisy telegram internals
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 BOT_TOKEN = "8692114721:AAFm_TAgpgZmG6Oshlua5VrAaqgO7gU44_M"
 ADMIN_IDS = [8477982865]
 KEYS_FILE = "keys.json"
@@ -83,6 +88,19 @@ MAX_CONCURRENT_BRUTEFORCE = 1
 MAX_RETRIES_PER_ACCOUNT = 3
 MAX_SINGLE_CHECK_RETRIES = 20
 MAX_BAN_CHECK_RETRIES = 20
+
+# Hard caps so a stuck check can never block a worker forever
+SINGLE_CHECK_HARD_TIMEOUT = 180.0
+BAN_CHECK_HARD_TIMEOUT = 180.0
+CREATION_DATE_HARD_TIMEOUT = 60.0
+
+# Global thread pool for ALL blocking network checks
+# (default executor is too small and gets exhausted when multiple users run checks)
+CHECK_EXECUTOR = ThreadPoolExecutor(max_workers=128, thread_name_prefix="mlbb-check")
+
+# Global cap across all users — prevents one user's bulk job from starving others
+GLOBAL_CHECK_LIMIT = 80
+GLOBAL_CHECK_SEM: Optional[asyncio.Semaphore] = None
 
 MIN_VALID_TS = 1451577600  # 2016-01-01
 
@@ -168,10 +186,6 @@ BAN_REASONS = {
 
 
 def parse_device_id(did: str) -> Tuple[str, str, str, str]:
-    """
-    Parse device ID into (full, md5, android_id, advertising_id).
-    Format: and_<32-char md5><16-char android_id><rest advertising_id>
-    """
     raw = did.strip()
     if raw.startswith("and_"):
         body = raw[4:]
@@ -397,10 +411,10 @@ def extract_player_data(result) -> Optional[dict]:
         hero_count = int(pd.get(4, 0) or 0)
         achievement_points = int(pd.get(7, 0) or 0)
         rating_score = int(pd.get(9, 0) or 0)
-        
+
         current_rank_raw = pd.get(8)
         high_rank_raw = pd.get(95)
-        
+
         current_rank = map_rank(current_rank_raw)
         high_rank = map_rank(high_rank_raw)
 
@@ -630,7 +644,7 @@ def format_result_line(res: dict) -> str:
 
 def format_single_check_result(result: dict) -> str:
     retries = result.get('retries_used', 1)
-    
+
     if result.get('status') == 'error':
         return (
             f"ERROR\n"
@@ -639,10 +653,10 @@ def format_single_check_result(result: dict) -> str:
             f"Error: {result.get('error', 'Unknown error')}\n"
             f"Retries: {retries}"
         )
-    
+
     device_id = result.get('device_id', 'N/A')
     device_short = device_id[:40] + "..." if len(device_id) > 40 else device_id
-    
+
     if not result.get('player_found', False) or result.get('status') == 'unregistered':
         return (
             f"UNREGISTERED ACCOUNT\n"
@@ -655,11 +669,11 @@ def format_single_check_result(result: dict) -> str:
             f"Status: Unregistered / Player Not Found\n"
             f"Retries: {retries}"
         )
-    
+
     elif result.get('status') == 'registered':
         player_data = result.get('player_data', {})
         ban_info = result.get('ban_info', {})
-        
+
         if player_data:
             nickname = player_data.get('nickname', '—')
             level = player_data.get('level', '—')
@@ -670,7 +684,7 @@ def format_single_check_result(result: dict) -> str:
             total_battles = player_data.get('total_battles', '—')
             collector_tier = player_data.get('collector_tier', '—')
             bindings = player_data.get('bindings', 'None')
-            
+
             ban_status = ban_info.get('status', 'UNKNOWN')
             if ban_status == "NOT BANNED":
                 ban_display = "CLEAN"
@@ -678,7 +692,7 @@ def format_single_check_result(result: dict) -> str:
                 ban_display = f"BANNED ({ban_info.get('ban_code', 'N/A')}: {ban_info.get('reason', 'Unknown')})"
             else:
                 ban_display = "UNKNOWN"
-            
+
             return (
                 f"REGISTERED ACCOUNT\n"
                 f"==================\n\n"
@@ -707,13 +721,13 @@ def format_single_check_result(result: dict) -> str:
                 f"Full details sent as file above\n"
                 f"Retries: {retries}"
             )
-    
+
     return "Unknown status"
 
 
 def format_ban_check_result(result: dict) -> str:
     retries = result.get('retries_used', 1)
-    
+
     if result.get('status') == 'error':
         return (
             f"BAN CHECK ERROR\n"
@@ -722,13 +736,13 @@ def format_ban_check_result(result: dict) -> str:
             f"Error: {result.get('error', 'Unknown error')}\n"
             f"Retries: {retries}"
         )
-    
+
     device_id = result.get('device_id', 'N/A')
     device_short = device_id[:40] + "..." if len(device_id) > 40 else device_id
     status = result.get('status', 'UNKNOWN')
     acc = result.get('account_id', 'N/A')
     zone = result.get('zone_id', 'N/A')
-    
+
     if status == 'BANNED':
         ban_code = result.get('ban_code', 'N/A')
         reason = result.get('reason', 'N/A')
@@ -775,13 +789,13 @@ def format_creation_date_result(result: dict) -> str:
             f"===================\n\n"
             f"Login failed! Device ID invalid or dead."
         )
-    
+
     device_id = result.get('did', 'N/A')
     device_short = device_id[:40] + "..." if len(device_id) > 40 else device_id
     acc = result.get('acc', 'N/A')
     zone = result.get('zone', 'N/A')
     ts = result.get('creation_ts', 0)
-    
+
     if ts and ts >= MIN_VALID_TS:
         date_str = fmt_timestamp_full(ts)
         age_str = fmt_age(ts)
@@ -799,7 +813,7 @@ def format_creation_date_result(result: dict) -> str:
         age_str = "N/A"
         age_days = 0
         cat_text = "UNKNOWN"
-    
+
     return (
         f"CREATION DATE RESULT\n"
         f"====================\n\n"
@@ -896,7 +910,6 @@ class LiveStats:
         self.unreg += 1
 
     def format(self) -> str:
-        avg_retries = (self.total_retries / self.total_hits) if self.total_hits > 0 else 0
         return (
             f"Live Stats\n"
             f"==========\n\n"
@@ -923,6 +936,7 @@ class KeyManager:
     def __init__(self):
         self.keys = self._load(KEYS_FILE)
         self.users = self._load(USERS_FILE)
+        self._lock = threading.Lock()
 
     def _load(self, path: str) -> dict:
         try:
@@ -948,36 +962,38 @@ class KeyManager:
             logger.error(f"Save users error: {e}")
 
     def generate_key(self, duration_seconds: int, label: str, created_by: int) -> str:
-        key = "ZYRON-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
-        self.keys[key] = {
-            "duration": duration_seconds, "label": label,
-            "created_by": created_by, "created_at": time.time(),
-            "used_by": None, "used_at": None
-        }
-        self._save_keys()
-        return key
+        with self._lock:
+            key = "ZYRON-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+            self.keys[key] = {
+                "duration": duration_seconds, "label": label,
+                "created_by": created_by, "created_at": time.time(),
+                "used_by": None, "used_at": None
+            }
+            self._save_keys()
+            return key
 
     def redeem_key(self, key: str, user_id: int) -> Tuple[bool, str]:
         key = key.strip().upper()
-        if key not in self.keys:
-            return False, "Invalid key."
-        kdata = self.keys[key]
-        if kdata["used_by"] is not None:
-            return False, "Key already used."
-        uid = str(user_id)
-        now = time.time()
-        kdata["used_by"] = user_id
-        kdata["used_at"] = now
-        self._save_keys()
-        current_expiry = self.users.get(uid, {}).get("expires", 0)
-        new_expiry = max(current_expiry, now) + kdata["duration"]
-        if uid not in self.users:
-            self.users[uid] = {}
-        self.users[uid]["expires"] = new_expiry
-        self.users[uid]["last_key"] = key
-        self._save_users()
-        expires_dt = datetime.fromtimestamp(new_expiry).strftime("%Y-%m-%d %H:%M:%S")
-        return True, f"Access granted!\nPlan: {kdata['label']}\nExpires: {expires_dt}"
+        with self._lock:
+            if key not in self.keys:
+                return False, "Invalid key."
+            kdata = self.keys[key]
+            if kdata["used_by"] is not None:
+                return False, "Key already used."
+            uid = str(user_id)
+            now = time.time()
+            kdata["used_by"] = user_id
+            kdata["used_at"] = now
+            self._save_keys()
+            current_expiry = self.users.get(uid, {}).get("expires", 0)
+            new_expiry = max(current_expiry, now) + kdata["duration"]
+            if uid not in self.users:
+                self.users[uid] = {}
+            self.users[uid]["expires"] = new_expiry
+            self.users[uid]["last_key"] = key
+            self._save_users()
+            expires_dt = datetime.fromtimestamp(new_expiry).strftime("%Y-%m-%d %H:%M:%S")
+            return True, f"Access granted!\nPlan: {kdata['label']}\nExpires: {expires_dt}"
 
     def has_access(self, user_id: int) -> bool:
         if user_id in ADMIN_IDS:
@@ -1018,19 +1034,21 @@ class KeyManager:
 
     def revoke_user(self, user_id: int) -> bool:
         uid = str(user_id)
-        if uid in self.users:
-            self.users[uid]["expires"] = 0
-            self._save_users()
-            return True
-        return False
+        with self._lock:
+            if uid in self.users:
+                self.users[uid]["expires"] = 0
+                self._save_users()
+                return True
+            return False
 
     def delete_key(self, key: str) -> bool:
         key = key.strip().upper()
-        if key in self.keys:
-            del self.keys[key]
-            self._save_keys()
-            return True
-        return False
+        with self._lock:
+            if key in self.keys:
+                del self.keys[key]
+                self._save_keys()
+                return True
+            return False
 
 
 def parse_duration(text: str) -> Tuple[Optional[int], Optional[str]]:
@@ -1261,6 +1279,10 @@ def _load_pool(path: str) -> List[str]:
 
 
 class _Bucket:
+    """Token bucket rate limiter.
+
+    IMPORTANT: sleeps OUTSIDE the lock so concurrent coroutines aren't serialized.
+    """
     def __init__(self, rate: float):
         self._rate = rate
         self._tokens = rate
@@ -1268,17 +1290,18 @@ class _Bucket:
         self._lock = asyncio.Lock()
 
     async def acquire(self):
-        async with self._lock:
-            now = time.monotonic()
-            delta = now - self._last
-            self._last = now
-            self._tokens = min(self._rate, self._tokens + delta * self._rate)
-            if self._tokens < 1:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                delta = now - self._last
+                self._last = now
+                self._tokens = min(self._rate, self._tokens + delta * self._rate)
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return
                 wait = (1 - self._tokens) / self._rate
-                await asyncio.sleep(wait)
-                self._tokens = 0
-            else:
-                self._tokens -= 1
+            # Sleep OUTSIDE the lock — critical for real concurrency
+            await asyncio.sleep(wait)
 
 
 async def _read_n(r: asyncio.StreamReader, n: int) -> bytes:
@@ -1686,28 +1709,24 @@ def check_ban_v2(device_id: str) -> dict:
 
 def check_ban_v2_with_retry(device_id: str, max_retries: int = MAX_BAN_CHECK_RETRIES) -> dict:
     """
-    Retry ban check up to MAX_BAN_CHECK_RETRIES times.
-    IMPORTANT: EARLY-RETURN as soon as we get a definitive answer (BANNED or NOT BANNED).
-    Kung nakuha na agad sa 1st, 3rd, 5th, 10th retry — send agad, hindi na hintayin ang 20.
+    Retry ban check up to MAX_BAN_CHECK_RETRIES.
+    EARLY-RETURN as soon as definitive answer (BANNED or NOT BANNED) is obtained.
     """
     last_result = None
     for attempt in range(1, max_retries + 1):
         res = check_ban_v2(device_id)
         last_result = res
         status = res.get("status")
-        
-        # ✅ DEFINITIVE ANSWER → send agad, huwag nang hintayin ang 20 retries
+
         if status in ("BANNED", "NOT BANNED"):
             res["retries_used"] = attempt
-            logger.info(f"[BAN CHECK] Definitive answer '{status}' on attempt {attempt}/{max_retries}")
+            logger.info(f"[BAN CHECK] Definitive '{status}' on attempt {attempt}/{max_retries}")
             return res
-        
-        # ❌ Hindi pa definitive — log at retry
+
         err = res.get("error", "unknown")
         logger.info(f"[BAN CHECK] Attempt {attempt}/{max_retries} for {device_id[:30]}... error={err}")
         time.sleep(0.6)
-    
-    # Naubos lahat ng retries, hindi pa rin definitive
+
     if last_result is not None:
         last_result["retries_used"] = max_retries
         if not last_result.get("error"):
@@ -1722,8 +1741,8 @@ def check_ban_v2_with_retry(device_id: str, max_retries: int = MAX_BAN_CHECK_RET
 
 
 async def check_ban_v2_async(device_id: str) -> dict:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, check_ban_v2, device_id)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(CHECK_EXECUTOR, check_ban_v2, device_id)
 
 
 # ================= CREATION DATE ONLY CHECK =================
@@ -1751,9 +1770,9 @@ async def _fetch_creation_date_only(did: str) -> Optional[dict]:
         acc = inner.get(0)
         if not acc:
             return None
-        
+
         creation_ts = int(inner.get(19, 0) or 0)
-        
+
         zr = inner.get(2)
         if isinstance(zr, list):
             zones = [z for z in zr if isinstance(z, int)] if zr else [0]
@@ -1764,7 +1783,7 @@ async def _fetch_creation_date_only(did: str) -> Optional[dict]:
         else:
             zones = [0]
         zone = zones[0] if zones else 0
-        
+
         return {
             'did': did,
             'acc': acc,
@@ -1783,13 +1802,23 @@ async def _fetch_creation_date_only(did: str) -> Optional[dict]:
 
 
 def check_creation_date_sync(device_id: str) -> Optional[dict]:
+    """Run creation date check in its own private event loop (isolated from bot loop)."""
     try:
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
+            asyncio.set_event_loop(loop)
             result = loop.run_until_complete(_fetch_creation_date_only(device_id))
         finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
             loop.close()
+            asyncio.set_event_loop(None)
         return result
     except Exception:
         return None
@@ -1798,10 +1827,6 @@ def check_creation_date_sync(device_id: str) -> Optional[dict]:
 async def _single_account_check_full(did: str) -> Optional[dict]:
     """
     Full single check: login + player info + ban check.
-    Returns:
-      - dict with 'unregistered': True if server definitively says no account
-      - dict with 'player': player data if successful
-      - None on network failure (caller should retry)
     """
     writer = None
     try:
@@ -1920,18 +1945,21 @@ async def _check_with_retry(did: str, sem: asyncio.Semaphore, bucket: _Bucket,
 
 
 async def _check(did: str, sem: asyncio.Semaphore, bucket: _Bucket) -> Optional[dict]:
+    global GLOBAL_CHECK_SEM
     await bucket.acquire()
-    async with sem:
-        return await _check_with_retry(did, sem, bucket, MAX_RETRIES_PER_ACCOUNT)
+    # Enforce global cap across all users so one job can't starve everyone
+    if GLOBAL_CHECK_SEM is None:
+        GLOBAL_CHECK_SEM = asyncio.Semaphore(GLOBAL_CHECK_LIMIT)
+    async with GLOBAL_CHECK_SEM:
+        async with sem:
+            return await _check_with_retry(did, sem, bucket, MAX_RETRIES_PER_ACCOUNT)
 
 
 def lookup_by_device_id(device_id: str, max_retries: int = MAX_SINGLE_CHECK_RETRIES) -> dict:
     """
-    Retry single check up to MAX_SINGLE_CHECK_RETRIES times.
-    IMPORTANT: EARLY-RETURN as soon as we get a definitive answer:
-      - REGISTERED (with player data)
-      - UNREGISTERED
-    Kung nakuha na sa 1st, 3rd, 5th, 10th retry — send agad, hindi na hintayin ang 20.
+    Retry single check up to MAX_SINGLE_CHECK_RETRIES.
+    EARLY-RETURN as soon as definitive answer (registered/unregistered).
+    Runs in its OWN private event loop per call — safe inside CHECK_EXECUTOR thread.
     """
     last_error = None
     last_result = None
@@ -1939,11 +1967,20 @@ def lookup_by_device_id(device_id: str, max_retries: int = MAX_SINGLE_CHECK_RETR
     for attempt in range(1, max_retries + 1):
         try:
             loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             try:
+                asyncio.set_event_loop(loop)
                 result = loop.run_until_complete(_single_account_check_full(device_id))
             finally:
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
                 loop.close()
+                asyncio.set_event_loop(None)
 
             if result is None:
                 last_error = "No response from server"
@@ -1953,9 +1990,8 @@ def lookup_by_device_id(device_id: str, max_retries: int = MAX_SINGLE_CHECK_RETR
 
             last_result = result
 
-            # ✅ DEFINITIVE: UNREGISTERED → send agad
             if result.get('unregistered'):
-                logger.info(f"[SINGLE CHECK] Definitive answer 'UNREGISTERED' on attempt {attempt}/{max_retries}")
+                logger.info(f"[SINGLE CHECK] Definitive 'UNREGISTERED' on attempt {attempt}/{max_retries}")
                 return {
                     'status': 'unregistered',
                     'device_id': device_id,
@@ -1967,11 +2003,10 @@ def lookup_by_device_id(device_id: str, max_retries: int = MAX_SINGLE_CHECK_RETR
                     'retries_used': attempt
                 }
 
-            # ✅ DEFINITIVE: REGISTERED with player data → send agad
             player = result.get('player')
             ban_info = result.get('ban_info', {})
             if player:
-                logger.info(f"[SINGLE CHECK] Definitive answer 'REGISTERED' on attempt {attempt}/{max_retries}")
+                logger.info(f"[SINGLE CHECK] Definitive 'REGISTERED' on attempt {attempt}/{max_retries}")
                 return {
                     'status': 'registered',
                     'device_id': device_id,
@@ -1984,7 +2019,6 @@ def lookup_by_device_id(device_id: str, max_retries: int = MAX_SINGLE_CHECK_RETR
                     'retries_used': attempt
                 }
 
-            # ❌ Account found pero walang player data — retry
             last_error = "Account found but no player data"
             logger.info(f"[SINGLE CHECK] Attempt {attempt}/{max_retries}: acc found, no player data yet")
             time.sleep(0.6)
@@ -1994,7 +2028,6 @@ def lookup_by_device_id(device_id: str, max_retries: int = MAX_SINGLE_CHECK_RETR
             logger.error(f"[SINGLE CHECK] Attempt {attempt}/{max_retries} error: {e}")
             time.sleep(0.6)
 
-    # Fallback kung naubos lahat ng retries
     if last_result is not None:
         if last_result.get('unregistered'):
             return {
@@ -2272,10 +2305,25 @@ def build_bruteforce_summary_text(result: Dict[str, Any]) -> str:
     )
 
 
+# ================ THREAD-SAFE TELEGRAM HELPERS ================
+# Throttle edits per (chat_id, message_id) to avoid Telegram rate-limits
+_edit_throttle_lock = threading.Lock()
+_last_edit_times: Dict[Tuple[int, int], float] = {}
+DEFAULT_EDIT_INTERVAL = 1.0
+
+
 def _threadsafe_edit_message(bot_instance, text: str, chat_id: int, message_id: int,
-                              reply_markup=None):
+                              reply_markup=None, min_interval: float = DEFAULT_EDIT_INTERVAL):
+    """Edit a message from a worker thread. Throttled per-message to avoid rate limits."""
     if MAIN_LOOP is None or bot_instance is None:
         return
+    key = (chat_id, message_id)
+    now = time.monotonic()
+    with _edit_throttle_lock:
+        last = _last_edit_times.get(key, 0.0)
+        if now - last < min_interval:
+            return
+        _last_edit_times[key] = now
     try:
         coro = bot_instance.edit_message_text(
             text=text,
@@ -2288,8 +2336,7 @@ def _threadsafe_edit_message(bot_instance, text: str, chat_id: int, message_id: 
         pass
 
 
-def _threadsafe_send_message(bot_instance, text: str, chat_id: int,
-                              reply_markup=None):
+def _threadsafe_send_message(bot_instance, text: str, chat_id: int, reply_markup=None):
     if MAIN_LOOP is None or bot_instance is None:
         return
     try:
@@ -2371,7 +2418,8 @@ def run_bruteforce_sync(profile: Dict[str, Any], total_loops: int, delay_sec: fl
                     text = build_bruteforce_progress_text(sess)
                     _threadsafe_edit_message(
                         bot_instance, text, chat_id, message_id,
-                        reply_markup=stop_markup
+                        reply_markup=stop_markup,
+                        min_interval=0.0,
                     )
 
             if count % 10 == 0:
@@ -2426,7 +2474,7 @@ class MLBBBot:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['mode'] = None
-        
+
         user_id = update.effective_user.id
         has_access = self._check_access(user_id)
         is_admin = self._is_admin(user_id)
@@ -2446,7 +2494,7 @@ class MLBBBot:
         )
         keyboard = []
         if has_access or is_admin:
-            keyboard.append([InlineKeyboardButton("Bulk Check", callback_data="check_file")])        
+            keyboard.append([InlineKeyboardButton("Bulk Check", callback_data="check_file")])
             keyboard.append([InlineKeyboardButton("Single Check", callback_data="single_check")])
             keyboard.append([InlineKeyboardButton("Ban Check Only", callback_data="ban_check_only")])
             keyboard.append([InlineKeyboardButton("Creation Date", callback_data="creation_date_only")])
@@ -2597,7 +2645,8 @@ class MLBBBot:
         if not self._check_access(user_id):
             await update.callback_query.answer("No access. /redeem <KEY>", show_alert=True)
             return
-        if user_id in self.active_tasks and not self.active_tasks[user_id]['done']:
+        # FIX: clean stale entries so a crashed previous task doesn't lock the user out
+        if user_id in self.active_tasks and not self.active_tasks[user_id].get('done', True):
             await update.callback_query.answer("Task running!", show_alert=True)
             return
         await update.callback_query.answer()
@@ -2611,7 +2660,7 @@ class MLBBBot:
         if not self._check_access(user_id):
             await update.callback_query.answer("No access. /redeem <KEY>", show_alert=True)
             return
-        if user_id in self.active_tasks and not self.active_tasks[user_id]['done']:
+        if user_id in self.active_tasks and not self.active_tasks[user_id].get('done', True):
             await update.callback_query.answer("Task running!", show_alert=True)
             return
         await update.callback_query.answer()
@@ -2719,17 +2768,17 @@ class MLBBBot:
         if not self._check_access(user_id):
             await update.message.reply_text("No access. /redeem <KEY>")
             return
-        
+
         if user_id in self.active_tasks and not self.active_tasks[user_id].get('done', True):
             await update.message.reply_text("You already have a running task. Please wait for it to finish.")
             return
-        
+
         context.user_data['mode'] = 'single'
-        
+
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
-        
+
         await update.message.reply_text(
             "Single Device ID Check\n\n"
             "Send a device ID to check.\n\n"
@@ -2744,18 +2793,18 @@ class MLBBBot:
         if not self._check_access(user_id):
             await query.answer("No access. /redeem <KEY>", show_alert=True)
             return
-        
+
         if user_id in self.active_tasks and not self.active_tasks[user_id].get('done', True):
             await query.answer("Task running! Please wait.", show_alert=True)
             return
-        
+
         await query.answer()
         context.user_data['mode'] = 'single'
-        
+
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
-        
+
         await query.edit_message_text(
             "Single Device ID Check\n\n"
             "Send a device ID to check.\n\n"
@@ -2767,39 +2816,48 @@ class MLBBBot:
     async def handle_single_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        
+
         context.user_data['mode'] = None
-        
+
         if not device_id.startswith("and_") and not device_id.startswith("ios_"):
             await update.message.reply_text(
                 "Invalid Device ID\n\n"
                 "Device ID must start with and_ or ios_"
             )
             return
-        
+
         if len(device_id) < 50:
             await update.message.reply_text(
                 f"Invalid Device ID\n\nDevice ID too short ({len(device_id)} chars, minimum 50)."
             )
             return
-        
+
         if any(c.isspace() for c in device_id):
             await update.message.reply_text("Invalid Device ID\n\nNo spaces allowed.")
             return
-        
+
         processing_msg = await update.message.reply_text(
             "Checking device ID...\n\n"
             "Will retry up to 20 times if needed. Once a definitive answer is received, result will be sent immediately."
         )
-        
+
         try:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, 
-                lookup_by_device_id, 
-                device_id
-            )
-            
+            loop = asyncio.get_running_loop()
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(CHECK_EXECUTOR, lookup_by_device_id, device_id),
+                    timeout=SINGLE_CHECK_HARD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                result = {
+                    'status': 'error',
+                    'device_id': device_id,
+                    'error': f'Check timed out after {int(SINGLE_CHECK_HARD_TIMEOUT)}s',
+                    'player_found': False,
+                    'is_registered': False,
+                    'retries_used': 0,
+                }
+
             full_info = format_full_info_text(device_id, {
                 'status': result.get('status', 'unknown'),
                 'acc': result.get('account_id'),
@@ -2808,7 +2866,7 @@ class MLBBBot:
                 'ban_info': result.get('ban_info', {}),
                 'error': result.get('error')
             })
-            
+
             file_content = (
                 f"MLBB Device Check Results\n"
                 f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -2817,30 +2875,30 @@ class MLBBBot:
                 f"{'=' * 60}\n"
                 f"End of Report"
             )
-            
+
             file_obj = io.BytesIO(file_content.encode('utf-8'))
             file_obj.name = f"MLBB_Device_Info_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            
+
             await context.bot.send_document(
                 chat_id,
                 document=file_obj,
                 filename=file_obj.name,
                 caption="Device Info"
             )
-            
+
             result_text = format_single_check_result(result)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result_text += f"\n\nChecked: {timestamp}"
-            
+
             await context.bot.send_message(chat_id, result_text)
-            
+
             try:
                 await processing_msg.delete()
             except Exception:
                 pass
-            
+
             logger.info(f"Single check completed for {device_id[:30]}... by user {user_id}")
-            
+
         except Exception as e:
             logger.error(f"Error in single check: {e}")
             try:
@@ -2855,13 +2913,13 @@ class MLBBBot:
         if not self._check_access(user_id):
             await update.message.reply_text("No access. /redeem <KEY>")
             return
-        
+
         context.user_data['mode'] = 'bancheck'
-        
+
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
-        
+
         await update.message.reply_text(
             "Ban Check Only \n\n"
             "Send a device ID to check ban status.\n\n"
@@ -2876,14 +2934,14 @@ class MLBBBot:
         if not self._check_access(user_id):
             await query.answer("No access. /redeem <KEY>", show_alert=True)
             return
-        
+
         await query.answer()
         context.user_data['mode'] = 'bancheck'
-        
+
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
-        
+
         await query.edit_message_text(
             "Ban Check Only \n\n"
             "Send a device ID to check ban status.\n\n"
@@ -2895,48 +2953,55 @@ class MLBBBot:
     async def handle_ban_check_only(self, update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        
+
         context.user_data['mode'] = None
-        
+
         if not device_id.startswith("and_") and not device_id.startswith("ios_"):
             await update.message.reply_text(
                 "Invalid Device ID\n\n"
                 "Device ID must start with and_ or ios_"
             )
             return
-        
+
         if len(device_id) < 50:
             await update.message.reply_text(
                 f"Invalid Device ID\n\nDevice ID too short ({len(device_id)} chars, minimum 50)."
             )
             return
-        
+
         processing_msg = await update.message.reply_text(
             "Checking ban status...\n\n"
             "Will retry up to 20 times if needed. Once a definitive answer is received, result will be sent immediately."
         )
-        
+
         try:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, 
-                check_ban_v2_with_retry, 
-                device_id
-            )
-            
+            loop = asyncio.get_running_loop()
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(CHECK_EXECUTOR, check_ban_v2_with_retry, device_id),
+                    timeout=BAN_CHECK_HARD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                result = {
+                    'status': 'UNKNOWN',
+                    'device_id': device_id,
+                    'error': f'Ban check timed out after {int(BAN_CHECK_HARD_TIMEOUT)}s',
+                    'retries_used': 0,
+                }
+
             result_text = format_ban_check_result(result)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result_text += f"\n\nChecked: {timestamp}"
-            
+
             await context.bot.send_message(chat_id, result_text)
-            
+
             try:
                 await processing_msg.delete()
             except Exception:
                 pass
-            
+
             logger.info(f"Ban check completed for {device_id[:30]}... by user {user_id}")
-            
+
         except Exception as e:
             logger.error(f"Error in ban check: {e}")
             try:
@@ -2951,13 +3016,13 @@ class MLBBBot:
         if not self._check_access(user_id):
             await update.message.reply_text("No access. /redeem <KEY>")
             return
-        
+
         context.user_data['mode'] = 'creationdate'
-        
+
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
-        
+
         await update.message.reply_text(
             "Check Creation Date Only \n\n"
             "Send a device ID to check account creation date.\n\n"
@@ -2973,14 +3038,14 @@ class MLBBBot:
         if not self._check_access(user_id):
             await query.answer("No access. /redeem <KEY>", show_alert=True)
             return
-        
+
         await query.answer()
         context.user_data['mode'] = 'creationdate'
-        
+
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
-        
+
         await query.edit_message_text(
             "Check Creation Date Only \n\n"
             "Send a device ID to check account creation date.\n\n"
@@ -2993,48 +3058,50 @@ class MLBBBot:
     async def handle_creation_date_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE, device_id: str):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        
+
         context.user_data['mode'] = None
-        
+
         if not device_id.startswith("and_") and not device_id.startswith("ios_"):
             await update.message.reply_text(
                 "Invalid Device ID\n\n"
                 "Device ID must start with and_ or ios_"
             )
             return
-        
+
         if len(device_id) < 50:
             await update.message.reply_text(
                 f"Invalid Device ID\n\nDevice ID too short ({len(device_id)} chars, minimum 50)."
             )
             return
-        
+
         processing_msg = await update.message.reply_text(
             "Fetching creation date...\n\n"
             "This is a fast check - please wait..."
         )
-        
+
         try:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, 
-                check_creation_date_sync, 
-                device_id
-            )
-            
+            loop = asyncio.get_running_loop()
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(CHECK_EXECUTOR, check_creation_date_sync, device_id),
+                    timeout=CREATION_DATE_HARD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                result = None
+
             result_text = format_creation_date_result(result)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result_text += f"\n\nChecked: {timestamp}"
-            
+
             await context.bot.send_message(chat_id, result_text)
-            
+
             try:
                 await processing_msg.delete()
             except Exception:
                 pass
-            
+
             logger.info(f"Creation date check completed for {device_id[:30]}... by user {user_id}")
-            
+
         except Exception as e:
             logger.error(f"Error in creation date check: {e}")
             try:
@@ -3050,7 +3117,6 @@ class MLBBBot:
             await update.message.reply_text("No access. /redeem <KEY>")
             return
 
-        # === FIX: clean up any stale session first ===
         with bruteforce_lock:
             old = bruteforce_sessions.get(user_id)
             if old:
@@ -3080,10 +3146,6 @@ class MLBBBot:
             }
 
     async def bfstop_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Fixed: properly cleans up sessions that are still waiting for input
-        (no running kicker thread), and honestly reports what was done.
-        """
         user_id = update.effective_user.id
 
         with bruteforce_lock:
@@ -3094,8 +3156,6 @@ class MLBBBot:
 
             stage = session.get('stage', 'unknown')
 
-            # If session is only waiting for input, no kicker is running.
-            # Just delete it and tell the user.
             if stage in ('awaiting_device', 'awaiting_mode',
                          'awaiting_custom_loops', 'awaiting_custom_delay'):
                 del bruteforce_sessions[user_id]
@@ -3104,7 +3164,6 @@ class MLBBBot:
                 )
                 return
 
-            # If a kicker thread is running, signal it to stop.
             if stage == 'running':
                 stop_event = session.get('stop_event')
                 if stop_event:
@@ -3113,23 +3172,18 @@ class MLBBBot:
                         "STOP signal sent. Brute force will stop shortly..."
                     )
                 else:
-                    # Running stage but no stop_event — clean up anyway.
                     del bruteforce_sessions[user_id]
                     await update.message.reply_text(
                         "Brute force session cleaned up (no stop_event found)."
                     )
                 return
 
-            # Unknown stage — clean up.
             del bruteforce_sessions[user_id]
             await update.message.reply_text(
                 f"Brute force session cancelled (stage was: {stage})."
             )
 
     async def bfstatus_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Fixed: handles all stages gracefully and never crashes on missing keys.
-        """
         user_id = update.effective_user.id
         with bruteforce_lock:
             session = bruteforce_sessions.get(user_id)
@@ -3219,9 +3273,14 @@ class MLBBBot:
                 f"Please wait..."
             )
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             try:
-                profile = await loop.run_in_executor(None, fetch_session_profile, device_id)
+                profile = await asyncio.wait_for(
+                    loop.run_in_executor(CHECK_EXECUTOR, fetch_session_profile, device_id),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                profile = None
             except Exception as e:
                 logger.error(f"fetch_session_profile executor error: {e}")
                 profile = None
@@ -3375,7 +3434,10 @@ class MLBBBot:
                     if sess:
                         sess['status'] = 'completed'
                 summary_text = build_bruteforce_summary_text(result)
-                _threadsafe_edit_message(bot_instance, summary_text, chat_id, start_msg.message_id, reply_markup=None)
+                _threadsafe_edit_message(
+                    bot_instance, summary_text, chat_id, start_msg.message_id,
+                    reply_markup=None, min_interval=0.0,
+                )
                 time.sleep(5)
             except Exception as e:
                 logger.error(f"run_and_finish error: {e}")
@@ -3524,9 +3586,9 @@ class MLBBBot:
             if not file.file_name.endswith('.txt'):
                 await update.message.reply_text("Send a .txt file")
                 return
-            
+
             context.user_data['mode'] = None
-            
+
             status_msg = await update.message.reply_text(f"Downloading {file.file_name}...")
             file_obj = await file.get_file()
             clean_filename = re.sub(r'[^a-zA-Z0-9_.-]', '', file.file_name)
@@ -3576,8 +3638,10 @@ class MLBBBot:
             else:
                 ids = data[:]
                 limit = len(ids)
-            concurrency = 40
-            rate = 40
+
+            # Lower per-user concurrency so multiple users don't saturate network
+            concurrency = 20
+            rate = 20
             sem = asyncio.Semaphore(concurrency)
             bucket = _Bucket(rate)
             lock = asyncio.Lock()
@@ -3592,7 +3656,11 @@ class MLBBBot:
                 nonlocal checked, valid, failed
                 if self.active_tasks[user_id]['cancelled']:
                     return
-                res = await _check(did, sem, bucket)
+                try:
+                    res = await _check(did, sem, bucket)
+                except Exception as e:
+                    logger.error(f"worker error: {e}")
+                    res = None
                 async with lock:
                     checked += 1
                     if res is not None and res.get('player'):
@@ -3737,10 +3805,21 @@ class MLBBBot:
 
         except Exception as e:
             logger.error(f"Task error: {e}")
-            await context.bot.send_message(chat_id, f"Error: {str(e)}")
+            try:
+                await context.bot.send_message(chat_id, f"Error: {str(e)}")
+            except Exception:
+                pass
         finally:
             self.active_tasks[user_id]['done'] = True
             self.live_stats.pop(user_id, None)
+            # Auto-cleanup active task entry after a grace period so user isn't
+            # permanently locked out if something went wrong
+            def _cleanup():
+                time.sleep(30)
+                t = self.active_tasks.get(user_id)
+                if t and t.get('done'):
+                    self.active_tasks.pop(user_id, None)
+            threading.Thread(target=_cleanup, daemon=True).start()
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -3759,7 +3838,6 @@ class MLBBBot:
             await self.generate(update, context)
         elif data == "bruteforce":
             await query.answer()
-            # === FIX: clean up any stale session before creating a new one ===
             with bruteforce_lock:
                 old = bruteforce_sessions.get(user_id)
                 if old:
@@ -3815,7 +3893,7 @@ class MLBBBot:
                 status_line = "No active access"
             keyboard = []
             if has_access or is_admin:
-                keyboard.append([InlineKeyboardButton("Bulk Check", callback_data="check_file")])     
+                keyboard.append([InlineKeyboardButton("Bulk Check", callback_data="check_file")])
                 keyboard.append([InlineKeyboardButton("Single Check", callback_data="single_check")])
                 keyboard.append([InlineKeyboardButton("Ban Check Only", callback_data="ban_check_only")])
                 keyboard.append([InlineKeyboardButton("Creation Date", callback_data="creation_date_only")])
@@ -3876,7 +3954,6 @@ class MLBBBot:
                 stage = session.get('stage')
                 if stage in ('awaiting_device', 'awaiting_mode',
                              'awaiting_custom_loops', 'awaiting_custom_delay'):
-                    # Not running — just clean up.
                     del bruteforce_sessions[target_user_id]
                     await query.answer("Session cancelled.", show_alert=True)
                     try:
@@ -3921,11 +3998,12 @@ class MLBBBot:
 
 
 async def post_init(application: Application) -> None:
-    global MAIN_LOOP
+    global MAIN_LOOP, GLOBAL_CHECK_SEM
     MAIN_LOOP = asyncio.get_running_loop()
+    GLOBAL_CHECK_SEM = asyncio.Semaphore(GLOBAL_CHECK_LIMIT)
     logger.info(f"Main event loop captured: {MAIN_LOOP}")
+    logger.info(f"Global check limit: {GLOBAL_CHECK_LIMIT}")
 
-    # === FIX: remove any active webhook so polling can work ===
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted (drop_pending_updates=True). Polling can now start.")
@@ -3962,6 +4040,8 @@ def main():
     print("MLBB Bot started!")
     print(f"Single check max retries: {MAX_SINGLE_CHECK_RETRIES}x (early-return on definitive answer)")
     print(f"Ban check max retries: {MAX_BAN_CHECK_RETRIES}x (early-return on definitive answer)")
+    print(f"Global check concurrency cap: {GLOBAL_CHECK_LIMIT}")
+    print(f"Check executor workers: 128")
     print("Press Ctrl+C to stop.")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
