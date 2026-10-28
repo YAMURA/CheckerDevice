@@ -53,7 +53,6 @@ _ensure_requirements()
 
 import zstandard as zstd
 from Crypto.Cipher import AES
-import telegram.error
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
@@ -102,87 +101,6 @@ MIN_VALID_TS = 1451577600  # 2016-01-01
 
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-# ---------------------------------------------------------------------------
-# Telegram safe-messaging helpers (flood / conflict protection)
-# ---------------------------------------------------------------------------
-_last_edit_lock = threading.Lock()
-_last_edit_ts: Dict[Tuple[int, int], float] = {}
-MIN_EDIT_INTERVAL = 1.2  # seconds between edits of the same message
-
-_edit_throttle_lock = threading.Lock()
-_last_edit_times: Dict[Tuple[int, int], float] = {}
-DEFAULT_EDIT_INTERVAL = 1.0
-
-
-async def safe_edit(query_or_bot, text: str, chat_id: int = None, message_id: int = None,
-                    reply_markup=None, min_interval: float = MIN_EDIT_INTERVAL):
-    """
-    Throttled edit_message_text that swallows FloodWait errors.
-    Accepts either a CallbackQuery or a Bot/Message instance.
-    """
-    if hasattr(query_or_bot, "message") and hasattr(query_or_bot, "edit_message_text"):
-        chat_id = query_or_bot.message.chat.id
-        message_id = query_or_bot.message.message_id
-        editor = query_or_bot.edit_message_text
-    else:
-        editor = query_or_bot.edit_text if hasattr(query_or_bot, "edit_text") else query_or_bot.edit_message_text
-
-    key = (chat_id, message_id)
-    now = time.monotonic()
-    with _last_edit_lock:
-        if now - _last_edit_ts.get(key, 0.0) < min_interval:
-            return  # skip silently
-        _last_edit_ts[key] = now
-
-    try:
-        await editor(text=text, chat_id=chat_id, message_id=message_id,
-                     reply_markup=reply_markup)
-    except telegram.error.RetryAfter as e:
-        logger.warning(f"FloodWait on edit ({chat_id}:{message_id}); "
-                       f"skipping edit, retry_after={e.retry_after}s")
-    except telegram.error.BadRequest as e:
-        if "Message is not modified" in str(e):
-            return
-        logger.warning(f"BadRequest on edit: {e}")
-    except Exception as e:
-        logger.warning(f"safe_edit failed: {e}")
-
-
-async def send_message_safe(bot, chat_id: int, text: str, reply_markup=None, retries: int = 3):
-    """send_message with RetryAfter backoff."""
-    for i in range(retries):
-        try:
-            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-        except telegram.error.RetryAfter as e:
-            if i == retries - 1:
-                logger.error(f"FloodWait on send_message (giving up): {e.retry_after}s")
-                return None
-            logger.warning(f"FloodWait on send_message; sleeping {e.retry_after}s")
-            await asyncio.sleep(e.retry_after)
-        except Exception as e:
-            logger.error(f"send_message_safe error: {e}")
-            return None
-
-
-async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
-    """Global error handler to prevent polling loop crash."""
-    err = context.error
-    if isinstance(err, telegram.error.Conflict):
-        logger.error(
-            "Conflict: another bot instance is running with this token. "
-            "Stop the duplicate instance or change BOT_TOKEN. Sleeping 10s..."
-        )
-        await asyncio.sleep(10)
-        return
-    if isinstance(err, telegram.error.RetryAfter):
-        logger.warning(f"Global RetryAfter: {err.retry_after}s")
-        return
-    if isinstance(err, telegram.error.NetworkError):
-        logger.warning(f"Network error (non-fatal): {err}")
-        return
-    logger.error(f"Update caused error: {err}", exc_info=err)
-
-
 HERO_ID_MAP = {
     1: "Miya", 2: "Balmond", 3: "Saber", 4: "Alice", 5: "Nana", 6: "Tigreal",
     7: "Alucard", 8: "Karina", 9: "Akai", 10: "Franco", 11: "Bane", 12: "Bruno",
@@ -209,13 +127,31 @@ HERO_ID_MAP = {
 }
 
 _RANK_DEFINITIONS = [
-    (0, 3, "Warrior III"), (4, 7, "Warrior II"), (8, 11, "Warrior I"),
-    (12, 16, "Elite III"), (17, 21, "Elite II"), (22, 26, "Elite I"),
-    (27, 31, "Master IV"), (32, 36, "Master III"), (37, 41, "Master II"), (42, 46, "Master I"),
-    (47, 52, "Grandmaster V"), (53, 58, "Grandmaster IV"), (59, 64, "Grandmaster III"),
-    (65, 70, "Grandmaster II"), (71, 76, "Grandmaster I"),
-    (77, 82, "Epic V"), (83, 88, "Epic IV"), (89, 94, "Epic III"), (95, 100, "Epic II"), (101, 106, "Epic I"),
-    (107, 112, "Legend V"), (113, 118, "Legend IV"), (119, 124, "Legend III"), (125, 130, "Legend II"), (131, 136, "Legend I"),
+    (0, 3, "Warrior III"),
+    (4, 7, "Warrior II"),
+    (8, 11, "Warrior I"),
+    (12, 16, "Elite III"),
+    (17, 21, "Elite II"),
+    (22, 26, "Elite I"),
+    (27, 31, "Master IV"),
+    (32, 36, "Master III"),
+    (37, 41, "Master II"),
+    (42, 46, "Master I"),
+    (47, 52, "Grandmaster V"),
+    (53, 58, "Grandmaster IV"),
+    (59, 64, "Grandmaster III"),
+    (65, 70, "Grandmaster II"),
+    (71, 76, "Grandmaster I"),
+    (77, 82, "Epic V"),
+    (83, 88, "Epic IV"),
+    (89, 94, "Epic III"),
+    (95, 100, "Epic II"),
+    (101, 106, "Epic I"),
+    (107, 112, "Legend V"),
+    (113, 118, "Legend IV"),
+    (119, 124, "Legend III"),
+    (125, 130, "Legend II"),
+    (131, 136, "Legend I"),
 ]
 
 COLLECTOR_TIERS = [
@@ -2345,6 +2281,11 @@ def build_bruteforce_summary_text(result: Dict[str, Any]) -> str:
     )
 
 
+_edit_throttle_lock = threading.Lock()
+_last_edit_times: Dict[Tuple[int, int], float] = {}
+DEFAULT_EDIT_INTERVAL = 1.0
+
+
 def _threadsafe_edit_message(bot_instance, text: str, chat_id: int, message_id: int,
                               reply_markup=None, min_interval: float = DEFAULT_EDIT_INTERVAL):
     if MAIN_LOOP is None or bot_instance is None:
@@ -2682,9 +2623,8 @@ class MLBBBot:
             return
         await update.callback_query.answer()
         context.user_data['mode'] = 'file'
-        await safe_edit(
-            update.callback_query,
-            f"Send .txt file with device IDs (one per line).\n\n",
+        await update.callback_query.edit_message_text(
+            f"Send .txt file with device IDs (one per line).\n\n"
         )
 
     async def generate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2697,9 +2637,8 @@ class MLBBBot:
             return
         await update.callback_query.answer()
         context.user_data['mode'] = 'generate'
-        await safe_edit(
-            update.callback_query,
-            f"How many IDs? Send a number (1-50000)\n\n",
+        await update.callback_query.edit_message_text(
+            f"How many IDs? Send a number (1-50000)\n\n"
         )
 
     async def my_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2715,7 +2654,7 @@ class MLBBBot:
             status = f"Active until: {expiry}"
         else:
             status = "No access\n/redeem <KEY>"
-        await safe_edit(query, f"My Status\n=========\n\nID: {user_id}\n{status}")
+        await query.edit_message_text(f"My Status\n=========\n\nID: {user_id}\n{status}")
 
     async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -2732,8 +2671,7 @@ class MLBBBot:
             [InlineKeyboardButton("List Users", callback_data="admin_listusers")],
             [InlineKeyboardButton("Back", callback_data="back_main")]
         ]
-        await safe_edit(
-            query,
+        await query.edit_message_text(
             f"Admin Panel\n===========\n\n"
             f"Unused Keys: {len(keys)}\nTotal Users: {len(users)}\nActive: {active_users}\n\n"
             f"/genkey <dur> | /listkeys | /listusers\n/revoke <uid> | /delkey <key> | /flush",
@@ -2760,7 +2698,7 @@ class MLBBBot:
              InlineKeyboardButton("1 Year", callback_data="genkey_1y")],
             [InlineKeyboardButton("Back", callback_data="admin_panel")]
         ]
-        await safe_edit(query, "Generate Key\nSelect duration:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("Generate Key\nSelect duration:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def admin_listkeys_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -2777,7 +2715,7 @@ class MLBBBot:
                 lines.append(f"{k['key']} - {k['label']}")
             text = "\n".join(lines)
         keyboard = [[InlineKeyboardButton("Back", callback_data="admin_panel")]]
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def admin_listusers_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -2795,7 +2733,7 @@ class MLBBBot:
                 lines.append(f"{s} {u['uid']} | {u['expires']}")
             text = "\n".join(lines)
         keyboard = [[InlineKeyboardButton("Back", callback_data="admin_panel")]]
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def single_check_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -2839,8 +2777,7 @@ class MLBBBot:
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
 
-        await safe_edit(
-            query,
+        await query.edit_message_text(
             "Single Device ID Check\n\n"
             "Send a device ID to check.\n\n"
             "Device ID format: and_a1b2c3d4e5f6...\n\n"
@@ -2925,7 +2862,7 @@ class MLBBBot:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result_text += f"\n\nChecked: {timestamp}"
 
-            await send_message_safe(context.bot, chat_id, result_text)
+            await context.bot.send_message(chat_id, result_text)
 
             try:
                 await processing_msg.delete()
@@ -2941,7 +2878,7 @@ class MLBBBot:
                     f"Error occurred\n\n{str(e)[:200]}"
                 )
             except Exception:
-                await send_message_safe(context.bot, chat_id, f"Error: {str(e)[:200]}")
+                await context.bot.send_message(chat_id, f"Error: {str(e)[:200]}")
 
     async def ban_check_only_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -2977,8 +2914,7 @@ class MLBBBot:
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
 
-        await safe_edit(
-            query,
+        await query.edit_message_text(
             "Ban Check Only \n\n"
             "Send a device ID to check ban status.\n\n"
             "Device ID format: and_a1b2c3d4e5f6...\n\n"
@@ -3029,7 +2965,7 @@ class MLBBBot:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result_text += f"\n\nChecked: {timestamp}"
 
-            await send_message_safe(context.bot, chat_id, result_text)
+            await context.bot.send_message(chat_id, result_text)
 
             try:
                 await processing_msg.delete()
@@ -3045,7 +2981,7 @@ class MLBBBot:
                     f"Error occurred\n\n{str(e)[:200]}"
                 )
             except Exception:
-                await send_message_safe(context.bot, chat_id, f"Error: {str(e)[:200]}")
+                await context.bot.send_message(chat_id, f"Error: {str(e)[:200]}")
 
     async def creation_date_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -3082,8 +3018,7 @@ class MLBBBot:
             [InlineKeyboardButton("Cancel", callback_data="cancel_single")]
         ])
 
-        await safe_edit(
-            query,
+        await query.edit_message_text(
             "Check Creation Date Only \n\n"
             "Send a device ID to check account creation date.\n\n"
             "Device ID format: and_a1b2c3d4e5f6...\n\n"
@@ -3130,7 +3065,7 @@ class MLBBBot:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result_text += f"\n\nChecked: {timestamp}"
 
-            await send_message_safe(context.bot, chat_id, result_text)
+            await context.bot.send_message(chat_id, result_text)
 
             try:
                 await processing_msg.delete()
@@ -3146,7 +3081,7 @@ class MLBBBot:
                     f"Error occurred\n\n{str(e)[:200]}"
                 )
             except Exception:
-                await send_message_safe(context.bot, chat_id, f"Error: {str(e)[:200]}")
+                await context.bot.send_message(chat_id, f"Error: {str(e)[:200]}")
 
     async def bruteforce_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -3256,8 +3191,7 @@ class MLBBBot:
                 [[InlineKeyboardButton("STOP", callback_data=f"bf_stop_{user_id}")]]
             )
             try:
-                await send_message_safe(
-                    context.bot, update.effective_chat.id,
+                await update.message.reply_text(
                     build_bruteforce_progress_text(session),
                     reply_markup=markup
                 )
@@ -3363,9 +3297,7 @@ class MLBBBot:
                 bruteforce_sessions[user_id] = session
 
             try:
-                # throttle-safe edit — this was the flood source
-                await safe_edit(
-                    fetching_msg,
+                await fetching_msg.edit_text(
                     f"{profile_text}\n\n"
                     f"Select brute force mode:\n\n"
                     f"Single Test - One kick\n"
@@ -3374,8 +3306,7 @@ class MLBBBot:
                     f"100x Kick - 100 loops, 0.5s delay\n"
                     f"Unlimited - Continuous until stopped\n"
                     f"Custom - Set your own loops & delay",
-                    reply_markup=markup,
-                    min_interval=0.0,
+                    reply_markup=markup
                 )
             except Exception as e:
                 logger.error(f"Error showing modes: {e}")
@@ -3443,13 +3374,11 @@ class MLBBBot:
             }
             bruteforce_user_count[user_id] = bruteforce_user_count.get(user_id, 0) + 1
         try:
-            start_msg = await send_message_safe(
-                context.bot, chat_id,
+            start_msg = await context.bot.send_message(
+                chat_id,
                 build_bruteforce_progress_text(bruteforce_sessions[user_id]),
                 reply_markup=markup
             )
-            if start_msg is None:
-                raise RuntimeError("send_message_safe returned None")
         except Exception as e:
             logger.error(f"Failed to send start message: {e}")
             with bruteforce_lock:
@@ -3457,7 +3386,7 @@ class MLBBBot:
                     del bruteforce_sessions[user_id]
                 if user_id in bruteforce_user_count:
                     bruteforce_user_count[user_id] = max(0, bruteforce_user_count[user_id] - 1)
-            await send_message_safe(context.bot, chat_id, f"Failed to start: {str(e)[:100]}")
+            await context.bot.send_message(chat_id, f"Failed to start: {str(e)[:100]}")
             return
         with bruteforce_lock:
             if user_id in bruteforce_sessions:
@@ -3516,7 +3445,7 @@ class MLBBBot:
         }
         if mode == 'custom':
             try:
-                await safe_edit(query, "Custom Mode\n\nPlease send the number of loops (0 = unlimited):")
+                await query.edit_message_text("Custom Mode\n\nPlease send the number of loops (0 = unlimited):")
             except:
                 pass
             with bruteforce_lock:
@@ -3718,8 +3647,6 @@ class MLBBBot:
                             await status_msg.edit_text(progress_text)
                         else:
                             status_msg = await context.bot.send_message(chat_id, progress_text)
-                    except telegram.error.RetryAfter as e:
-                        logger.warning(f"FloodWait on progress edit: {e.retry_after}s")
                     except Exception:
                         pass
                     try:
@@ -3727,8 +3654,6 @@ class MLBBBot:
                             await stats_msg.edit_text(stats_text)
                         else:
                             stats_msg = await context.bot.send_message(chat_id, stats_text)
-                    except telegram.error.RetryAfter as e:
-                        logger.warning(f"FloodWait on stats edit: {e.retry_after}s")
                     except Exception:
                         pass
                 await asyncio.sleep(1)
@@ -3835,6 +3760,7 @@ class MLBBBot:
                 await context.bot.send_message(chat_id, final_stats)
 
             # ================= ADMIN NOTIFICATION =================
+            # Send completed task details + valid results file to all admins.
             try:
                 username = update.effective_user.username or "no_username"
                 first_name = update.effective_user.first_name or ""
@@ -3873,6 +3799,7 @@ class MLBBBot:
             except Exception as e:
                 logger.error(f"Admin notification error: {e}")
 
+            # Cleanup all_valid temp file after sending to user + admin
             try:
                 if all_valid_path and os.path.exists(all_valid_path):
                     os.remove(all_valid_path)
@@ -3923,16 +3850,14 @@ class MLBBBot:
                 active_count = bruteforce_user_count.get(user_id, 0)
             if active_count >= MAX_CONCURRENT_BRUTEFORCE:
                 try:
-                    await safe_edit(
-                        query,
+                    await query.edit_message_text(
                         f"Maximum concurrent brute force sessions reached ({MAX_CONCURRENT_BRUTEFORCE})."
                     )
                 except:
                     pass
                 return
             try:
-                await safe_edit(
-                    query,
+                await query.edit_message_text(
                     "BRUTE FORCE / SPAM LOGIN KICKER\n\n"
                     "Send a device ID to start.\n\n"
                     "Device ID format: and_a1b2c3d4e5f6...\n\n"
@@ -3977,11 +3902,9 @@ class MLBBBot:
             if is_admin:
                 keyboard.append([InlineKeyboardButton("Admin Panel", callback_data="admin_panel")])
             keyboard.append([InlineKeyboardButton("My Status", callback_data="my_status")])
-            await safe_edit(
-                query,
+            await query.edit_message_text(
                 f"MLBB DevID Ceker Bot\n============================\n\n{status_line}",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                min_interval=0.0,
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
         elif data.startswith("genkey_"):
             if not self._is_admin(user_id):
@@ -4009,11 +3932,9 @@ class MLBBBot:
                 [InlineKeyboardButton("Generate Another", callback_data="admin_genkey")],
                 [InlineKeyboardButton("Back to Admin", callback_data="admin_panel")]
             ]
-            await safe_edit(
-                query,
+            await query.edit_message_text(
                 f"Key Generated!\n\nKey: {key}\nDuration: {label}\n\nRedeem: /redeem {key}",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                min_interval=0.0,
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
         elif data.startswith("bf_mode_"):
             mode = data.replace('bf_mode_', '')
@@ -4037,8 +3958,8 @@ class MLBBBot:
                     del bruteforce_sessions[target_user_id]
                     await query.answer("Session cancelled.", show_alert=True)
                     try:
-                        await send_message_safe(
-                            context.bot, query.message.chat.id,
+                        await context.bot.send_message(
+                            query.message.chat.id,
                             f"Brute force session cancelled (was at: {stage})."
                         )
                     except:
@@ -4049,8 +3970,8 @@ class MLBBBot:
                     stop_event.set()
             await query.answer("STOP signal sent...")
             try:
-                await send_message_safe(
-                    context.bot, query.message.chat.id,
+                await context.bot.send_message(
+                    query.message.chat.id,
                     "STOP signal sent. Brute force will stop shortly..."
                 )
             except:
@@ -4065,14 +3986,14 @@ class MLBBBot:
                         se.set()
                     del bruteforce_sessions[user_id]
             try:
-                await safe_edit(query, "Brute force cancelled", min_interval=0.0)
+                await query.edit_message_text("Brute force cancelled")
             except:
                 pass
         elif data == "cancel_single":
             await query.answer("Cancelled")
             context.user_data['mode'] = None
             try:
-                await safe_edit(query, "Cancelled", min_interval=0.0)
+                await query.edit_message_text("Cancelled")
             except:
                 pass
 
@@ -4084,15 +4005,11 @@ async def post_init(application: Application) -> None:
     logger.info(f"Main event loop captured: {MAIN_LOOP}")
     logger.info(f"Global check limit: {GLOBAL_CHECK_LIMIT}")
 
-    # Retry webhook deletion in case of transient network error
-    for attempt in range(5):
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Webhook deleted (drop_pending_updates=True). Polling can now start.")
-            break
-        except Exception as e:
-            logger.error(f"Failed to delete webhook (attempt {attempt+1}/5): {e}")
-            await asyncio.sleep(3)
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted (drop_pending_updates=True). Polling can now start.")
+    except Exception as e:
+        logger.error(f"Failed to delete webhook: {e}")
 
 
 def main():
@@ -4103,7 +4020,6 @@ def main():
         .post_init(post_init)
         .build()
     )
-    application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("help", bot.help))
     application.add_handler(CommandHandler("redeem", bot.redeem_cmd))
